@@ -1,786 +1,424 @@
-import asyncio
+#!/usr/bin/env python3
+"""
+简化版WebUI - 教育视频生成器
+核心功能：输入文章 → 生成对话 → 生成视频
+"""
+
 import os
-import platform
 import sys
+import time
+import asyncio
+import subprocess
 from uuid import uuid4
 
 import streamlit as st
 from loguru import logger
 
-# Add the root directory of the project to the system path to allow importing modules from the project
+# 添加项目根目录到系统路径
 root_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if root_dir not in sys.path:
     sys.path.append(root_dir)
-    print("******** sys.path ********")
-    print(sys.path)
-    print("")
 
 from app.config import config
-from typing import List
-from app.models.schema import (
-    MaterialInfo,
-    VideoAspect,
-    VideoConcatMode,
-    VideoParams,
-    VideoTransitionMode,
-    PodcastScript,
-)
-from app.services import llm, voice
-from app.services import task as tm
-from app.services.podcast_audio import podcast_audio_generator
+from app.models.schema import PodcastScript, VideoAspect
+from app.services import llm
+from app.services import podcast_audio
+from app.services.image_generator import generate_sentence_image
 from app.utils import utils
 
+# 页面配置
 st.set_page_config(
-    page_title="MoneyPrinterTurbo - 播客视频生成器",
-    page_icon="🎙️",
+    page_title="教育视频生成器",
+    page_icon="📚",
     layout="wide",
-    initial_sidebar_state="auto",
-    menu_items={
-        "Report a bug": "https://github.com/harry0703/MoneyPrinterTurbo/issues",
-        "About": "# MoneyPrinterTurbo 播客视频生成器\n"
-        "粘贴文章内容，自动生成双人播客对话，并合成带字幕的高清短视频。\n"
-        "支持多种音色组合，智能匹配视频素材，一键生成专业播客视频。\n\n"
-        "https://github.com/harry0703/MoneyPrinterTurbo",
-    },
+    initial_sidebar_state="collapsed"
 )
 
-
-streamlit_style = """
+# 隐藏所有Streamlit默认样式
+st.markdown("""
 <style>
-h1 {
-    padding-top: 0 !important;
-}
+    .stApp > header {background-color: transparent;}
+    .stApp > footer {display: none;}
+    .stApp {padding-top: 1rem;}
+    section[data-testid="stSidebar"] {display: none;}
+    .block-container {padding-top: 1rem; padding-bottom: 1rem;}
 </style>
-"""
-st.markdown(streamlit_style, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# 定义资源目录
-font_dir = os.path.join(root_dir, "resource", "fonts")
-song_dir = os.path.join(root_dir, "resource", "songs")
-i18n_dir = os.path.join(root_dir, "webui", "i18n")
-config_file = os.path.join(root_dir, "webui", ".streamlit", "webui.toml")
-system_locale = utils.get_system_locale()
+# 初始化日志
+logger.remove()
+logger.add(sys.stdout, level="INFO", format="{message}")
 
-
-if "video_terms" not in st.session_state:
-    st.session_state["video_terms"] = ""
-if "ui_language" not in st.session_state:
-    st.session_state["ui_language"] = config.ui.get("language", system_locale)
-
-# 播客相关状态
-if "article_text" not in st.session_state:
-    st.session_state["article_text"] = ""
+# ============ 会话状态初始化 ============
 if "podcast_script" not in st.session_state:
     st.session_state["podcast_script"] = None
-if "speaker_1_voice" not in st.session_state:
-    st.session_state["speaker_1_voice"] = config.app.get("podcast", {}).get("default_speaker_1_voice", "zh-CN-XiaoxiaoNeural-Female")
-if "speaker_2_voice" not in st.session_state:
-    st.session_state["speaker_2_voice"] = config.app.get("podcast", {}).get("default_speaker_2_voice", "zh-CN-YunxiNeural-Male")
+if "video_terms" not in st.session_state:
+    st.session_state["video_terms"] = []
+if "task_output_dir" not in st.session_state:
+    st.session_state["task_output_dir"] = None
+if "generation_complete" not in st.session_state:
+    st.session_state["generation_complete"] = False
+if "error_message" not in st.session_state:
+    st.session_state["error_message"] = None
 
-# 加载语言文件
-locales = utils.load_locales(i18n_dir)
+# ============ 核心功能函数 ============
 
-# 创建一个顶部栏，包含标题和语言选择
-title_col, lang_col = st.columns([3, 1])
-
-with title_col:
-    st.title(f"MoneyPrinterTurbo v{config.project_version}")
-
-with lang_col:
-    display_languages = []
-    selected_index = 0
-    for i, code in enumerate(locales.keys()):
-        display_languages.append(f"{code} - {locales[code].get('Language')}")
-        if code == st.session_state.get("ui_language", ""):
-            selected_index = i
-
-    selected_language = st.selectbox(
-        "Language / 语言",
-        options=display_languages,
-        index=selected_index,
-        key="top_language_selector",
-        label_visibility="collapsed",
-    )
-    if selected_language:
-        code = selected_language.split(" - ")[0].strip()
-        st.session_state["ui_language"] = code
-        config.ui["language"] = code
-
-support_locales = [
-    "zh-CN",
-    "zh-HK",
-    "zh-TW",
-    "de-DE",
-    "en-US",
-    "fr-FR",
-    "vi-VN",
-    "th-TH",
-]
-
-
-def get_all_fonts():
-    fonts = []
-    for root, dirs, files in os.walk(font_dir):
-        for file in files:
-            if file.endswith(".ttf") or file.endswith(".ttc"):
-                fonts.append(file)
-    fonts.sort()
-    return fonts
-
-
-def get_all_songs():
-    songs = []
-    for root, dirs, files in os.walk(song_dir):
-        for file in files:
-            if file.endswith(".mp3"):
-                songs.append(file)
-    return songs
-
-
-def open_task_folder(task_id):
+def generate_podcast_video(article_text: str, output_dir: str):
+    """生成播客视频的完整流程"""
+    
+    results = {
+        "success": False,
+        "script": None,
+        "terms": [],
+        "images": [],
+        "audio_segments": [],
+        "video_path": None,
+        "error": None
+    }
+    
     try:
-        sys = platform.system()
-        path = os.path.join(root_dir, "storage", "tasks", task_id)
-        if os.path.exists(path):
-            if sys == "Windows":
-                os.system(f"start {path}")
-            if sys == "Darwin":
-                os.system(f"open {path}")
-    except Exception as e:
-        logger.error(e)
-
-
-def _format_podcast_script(podcast_script: List[PodcastScript]) -> str:
-    """将播客对话脚本格式化为便于预览的文本。"""
-    if not podcast_script:
-        return ""
-
-    script_lines = []
-    for i, dialogue in enumerate(podcast_script):
-        script_lines.append(f"第 {i + 1} 轮")
-        script_lines.append(f"A: {dialogue.speaker_1}")
-        script_lines.append(f"B: {dialogue.speaker_2}")
-        if i < len(podcast_script) - 1:
-            script_lines.append("")
-
-    return "\n".join(script_lines)
-
-
-def apply_selected_voices(podcast_script: List[PodcastScript]) -> List[PodcastScript]:
-    for dialogue in podcast_script or []:
-        dialogue.speaker_1_voice = st.session_state["speaker_1_voice"]
-        dialogue.speaker_2_voice = st.session_state["speaker_2_voice"]
-    return podcast_script
-
-
-def run_tts_preview(text: str, voice_name: str, voice_rate: float) -> str:
-    temp_dir = utils.storage_dir("temp", create=True)
-    audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
-    asyncio.run(
-        voice.tts(
-            text=text,
-            voice_name=voice_name,
-            voice_rate=voice_rate,
-            voice_file=audio_file,
+        # 步骤1: 生成播客脚本
+        st.info("📝 正在生成播客脚本...")
+        podcast_script = llm.generate_podcast_script(
+            article_text=article_text,
+            language="English"
         )
-    )
-    return audio_file if os.path.exists(audio_file) else ""
-
-
-def scroll_to_bottom():
-    js = """
-    <script>
-        console.log("scroll_to_bottom");
-        function scroll(dummy_var_to_force_repeat_execution){
-            var sections = parent.document.querySelectorAll('section.main');
-            console.log(sections);
-            for(let index = 0; index<sections.length; index++) {
-                sections[index].scrollTop = sections[index].scrollHeight;
-            }
-        }
-        scroll(1);
-    </script>
-    """
-    st.components.v1.html(js, height=0, width=0)
-
-
-def init_log():
-    logger.remove()
-    _lvl = "DEBUG"
-
-    def format_record(record):
-        # 获取日志记录中的文件全路径
-        file_path = record["file"].path
-        # 将绝对路径转换为相对于项目根目录的路径
-        relative_path = os.path.relpath(file_path, root_dir)
-        # 更新记录中的文件路径
-        record["file"].path = f"./{relative_path}"
-        # 返回修改后的格式字符串
-        # 您可以根据需要调整这里的格式
-        record["message"] = record["message"].replace(root_dir, ".")
-
-        _format = (
-            "<green>{time:%Y-%m-%d %H:%M:%S}</> | "
-            + "<level>{level}</> | "
-            + '"{file.path}:{line}":<blue> {function}</> '
-            + "- <level>{message}</>"
-            + "\n"
-        )
-        return _format
-
-    logger.add(
-        sys.stdout,
-        level=_lvl,
-        format=format_record,
-        colorize=True,
-    )
-
-
-init_log()
-
-locales = utils.load_locales(i18n_dir)
-
-
-def tr(key):
-    loc = locales.get(st.session_state["ui_language"], {})
-    return loc.get("Translation", {}).get(key, key)
-
-
-# 创建基础设置折叠框
-if not config.app.get("hide_config", False):
-    with st.expander(tr("Basic Settings"), expanded=False):
-        config_panels = st.columns(3)
-        left_config_panel = config_panels[0]
-        middle_config_panel = config_panels[1]
-        right_config_panel = config_panels[2]
-
-        # 左侧面板 - 日志设置
-        with left_config_panel:
-            # 是否隐藏配置面板
-            hide_config = st.checkbox(
-                tr("Hide Basic Settings"), value=config.app.get("hide_config", False)
-            )
-            config.app["hide_config"] = hide_config
-
-            # 是否禁用日志显示
-            hide_log = st.checkbox(
-                tr("Hide Log"), value=config.ui.get("hide_log", False)
-            )
-            config.ui["hide_log"] = hide_log
-
-        # 中间面板 - LLM 设置 (仅使用 SiliconFlow)
-
-        with middle_config_panel:
-            st.write(tr("LLM Settings"))
-            
-            # 固定使用 SiliconFlow
-            st.info("使用 SiliconFlow 作为 LLM 提供商")
-            llm_provider = "siliconflow"
-            
-            siliconflow_api_key = config.siliconflow.get("api_key", "")
-            st_siliconflow_api_key = st.text_input(
-                "SiliconFlow API Key", 
-                value=siliconflow_api_key, 
-                type="password"
-            )
-            
-            if st_siliconflow_api_key:
-                config.siliconflow["api_key"] = st_siliconflow_api_key
-            
-            tips = """
-                    ##### SiliconFlow 配置说明
-                    - **API Key**: [点击到官网申请](https://cloud.siliconflow.cn/)
-                    - 支持模型: Qwen/Qwen3-8B, zai-org/GLM-4.6, deepseek-ai/DeepSeek-V3.2
-                    - 国内可直接访问，不需要VPN
-                    - 注册就送额度
-                    """
-            st.info(tips)
-
-        # 右侧面板 - SiliconFlow 设置
-        with right_config_panel:
-            st.write(tr("SiliconFlow Settings"))
-            
-            # SiliconFlow 图片生成 API Key
-            siliconflow_image_key = config.siliconflow.get("api_key", "")
-            siliconflow_image_key = st.text_input(
-                "SiliconFlow API Key", 
-                value=siliconflow_image_key, 
-                type="password"
-            )
-            if siliconflow_image_key:
-                config.siliconflow["api_key"] = siliconflow_image_key
-
-panel = st.columns(3)
-left_panel = panel[0]
-middle_panel = panel[1]
-right_panel = panel[2]
-
-params = VideoParams()
-uploaded_files = []
-
-with left_panel:
-    with st.container(border=True):
-        st.write(tr("播客视频设置"))
-
-        # 文章输入区域
-        st.session_state["article_text"] = st.text_area(
-            tr("粘贴文章内容"),
-            value=st.session_state["article_text"],
-            height=300,
-            help=tr("请输入要转换为播客视频的文章内容"),
-            key="article_text_input"
-        ).strip()
-
-        # 播客音色选择
-        st.subheader(tr("音色设置"))
-
-        # 获取推荐音色配对
-        voice_pairs = podcast_audio_generator.get_recommended_voice_pairs()
-
-        # 创建音色选择列
-        voice_cols = st.columns(2)
-
-        with voice_cols[0]:
-            # 说话人1音色
-            speaker_1_voices = [pair[0] for pair in voice_pairs]
-            speaker_1_index = 0
-            for i, voice_option in enumerate(speaker_1_voices):
-                if voice_option == st.session_state["speaker_1_voice"]:
-                    speaker_1_index = i
-                    break
-
-            selected_speaker_1_voice = st.selectbox(
-                tr("说话人1音色"),
-                options=speaker_1_voices,
-                index=speaker_1_index,
-                key="speaker_1_voice_select"
-            )
-            st.session_state["speaker_1_voice"] = selected_speaker_1_voice
-
-        with voice_cols[1]:
-            # 说话人2音色
-            speaker_2_voices = [pair[1] for pair in voice_pairs]
-            speaker_2_index = 0
-            for i, voice_option in enumerate(speaker_2_voices):
-                if voice_option == st.session_state["speaker_2_voice"]:
-                    speaker_2_index = i
-                    break
-
-            selected_speaker_2_voice = st.selectbox(
-                tr("说话人2音色"),
-                options=speaker_2_voices,
-                index=speaker_2_index,
-                key="speaker_2_voice_select"
-            )
-            st.session_state["speaker_2_voice"] = selected_speaker_2_voice
-
-        # 语言选择
-        video_languages = [
-            (tr("Auto Detect"), ""),
-        ]
-        for code in support_locales:
-            video_languages.append((code, code))
-
-        selected_index = st.selectbox(
-            tr("脚本语言"),
-            index=0,
-            options=range(
-                len(video_languages)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_languages[x][
-                0
-            ],  # The label is displayed to the user
-        )
-        params.video_language = video_languages[selected_index][1]
-
-        # 生成播客对话按钮
-        if st.button(
-            tr("生成播客对话"), key="generate_podcast_script"
-        ):
-            if not st.session_state["article_text"]:
-                st.error(tr("请输入文章内容"))
-                st.stop()
-
-            with st.spinner(tr("正在生成播客对话...")):
-                try:
-                    # 生成播客脚本
-                    podcast_script = llm.generate_podcast_script(
-                        article_text=st.session_state["article_text"],
-                        language=params.video_language
+        
+        if not podcast_script:
+            results["error"] = "生成播客脚本失败"
+            return results
+        
+        # 设置语音
+        for turn in podcast_script:
+            turn.speaker_1_voice = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:anna-Female"
+            turn.speaker_2_voice = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:benjamin-Male"
+        
+        results["script"] = podcast_script
+        logger.info(f"✅ 成功生成 {len(podcast_script)} 轮对话")
+        
+        # 步骤2: 提取关键词
+        st.info("🔑 正在提取关键词...")
+        video_terms = llm.generate_terms_from_podcast(podcast_script=podcast_script, amount=5)
+        results["terms"] = video_terms
+        logger.info(f"✅ 关键词: {', '.join(video_terms)}")
+        
+        # 步骤3: 生成音频片段
+        st.info("🔊 正在生成语音音频...")
+        audio_segments = []
+        segment_index = 0
+        
+        for turn_idx, turn in enumerate(podcast_script, 1):
+            # Speaker 1 音频
+            if turn.speaker_1:
+                audio_path = os.path.join(output_dir, f"audio_segment_{segment_index}_speaker1.mp3")
+                audio_file, duration = asyncio.run(
+                    podcast_audio.podcast_audio_generator.generate_single_speaker_audio(
+                        text=turn.speaker_1,
+                        voice_name=turn.speaker_1_voice,
+                        output_path=audio_path,
+                        voice_rate=1.0,
+                        voice_volume=1.0
                     )
-
-                    if podcast_script:
-                        podcast_script = apply_selected_voices(podcast_script)
-                        st.session_state["podcast_script"] = podcast_script
-                        st.success(tr("播客对话生成成功！"))
-
-                        # 显示生成的对话预览
-                        with st.expander(tr("查看生成的播客对话"), expanded=True):
-                            for i, dialogue in enumerate(podcast_script):
-                                st.write(f"**说话人1**: {dialogue.speaker_1}")
-                                st.write(f"**说话人2**: {dialogue.speaker_2}")
-                                if i < len(podcast_script) - 1:
-                                    st.write("---")
-                    else:
-                        st.error(tr("播客对话生成失败，请重试"))
-
-                except Exception as e:
-                    st.error(tr(f"生成播客对话时出错: {str(e)}"))
-
-        # 显示生成的播客脚本（只读）
-        if st.session_state["podcast_script"]:
-            st.subheader(tr("生成的播客脚本"))
-            st.text_area(
-                tr("播客脚本"),
-                value=_format_podcast_script(st.session_state["podcast_script"]),
-                height=240,
-                disabled=True
-            )
-
-with middle_panel:
-    with st.container(border=True):
-        st.write(tr("Video Settings"))
-        video_concat_modes = [
-            (tr("Sequential"), "sequential"),
-            (tr("Random"), "random"),
-        ]
-        video_sources = [
-            (tr("SiliconFlow AI"), "siliconflow"),
-        ]
-
-        saved_video_source_name = config.app.get("video_source", "siliconflow")
-        saved_video_source_index = [v[1] for v in video_sources].index(
-            saved_video_source_name
-        )
-
-        selected_index = st.selectbox(
-            tr("Video Source"),
-            options=range(len(video_sources)),
-            format_func=lambda x: video_sources[x][0],
-            index=saved_video_source_index,
-        )
-        params.video_source = video_sources[selected_index][1]
-        config.app["video_source"] = params.video_source
-
-        if params.video_source == "local":
-            uploaded_files = st.file_uploader(
-                "Upload Local Files",
-                type=["mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"],
-                accept_multiple_files=True,
-            )
-
-        selected_index = st.selectbox(
-            tr("Video Concat Mode"),
-            index=1,
-            options=range(
-                len(video_concat_modes)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_concat_modes[x][
-                0
-            ],  # The label is displayed to the user
-        )
-        params.video_concat_mode = VideoConcatMode(
-            video_concat_modes[selected_index][1]
-        )
-
-        # 视频转场模式
-        video_transition_modes = [
-            (tr("None"), VideoTransitionMode.none.value),
-            (tr("Shuffle"), VideoTransitionMode.shuffle.value),
-            (tr("FadeIn"), VideoTransitionMode.fade_in.value),
-            (tr("FadeOut"), VideoTransitionMode.fade_out.value),
-            (tr("SlideIn"), VideoTransitionMode.slide_in.value),
-            (tr("SlideOut"), VideoTransitionMode.slide_out.value),
-        ]
-        selected_index = st.selectbox(
-            tr("Video Transition Mode"),
-            options=range(len(video_transition_modes)),
-            format_func=lambda x: video_transition_modes[x][0],
-            index=0,
-        )
-        params.video_transition_mode = VideoTransitionMode(
-            video_transition_modes[selected_index][1]
-        )
-
-        video_aspect_ratios = [
-            (tr("Portrait"), VideoAspect.portrait.value),
-            (tr("Landscape"), VideoAspect.landscape.value),
-        ]
-        selected_index = st.selectbox(
-            tr("Video Ratio"),
-            options=range(
-                len(video_aspect_ratios)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: video_aspect_ratios[x][
-                0
-            ],  # The label is displayed to the user
-        )
-        params.video_aspect = VideoAspect(video_aspect_ratios[selected_index][1])
-
-        params.video_clip_duration = st.selectbox(
-            tr("Clip Duration"), options=[2, 3, 4, 5, 6, 7, 8, 9, 10], index=1
-        )
-        params.video_count = st.selectbox(
-            tr("Number of Videos Generated Simultaneously"),
-            options=[1, 2, 3, 4, 5],
-            index=0,
-        )
-    with st.container(border=True):
-        st.write(tr("Audio Settings"))
-
-        # TTS 服务器（固定使用 SiliconFlow）
-        st.info("使用 SiliconFlow 作为 TTS 服务")
-        selected_tts_server = "siliconflow"
-        config.ui["tts_server"] = selected_tts_server
-
-        # 获取 SiliconFlow 的声音列表
-        filtered_voices = voice.get_siliconflow_voices()
-
-        voice_name = st.session_state["speaker_1_voice"]
-        if not filtered_voices:
-            st.warning(
-                tr(
-                    "No voices available for the selected TTS server. Please select another server."
                 )
-            )
-
-        preview_cols = st.columns(2)
-        preview_text = tr("Voice Example")
-        if st.session_state["podcast_script"]:
-            first_dialogue = st.session_state["podcast_script"][0]
-            preview_text = first_dialogue.speaker_1 or first_dialogue.speaker_2 or preview_text
-
-        with preview_cols[0]:
-            if st.button(tr("试听说话人1")):
-                with st.spinner(tr("Synthesizing Voice")):
-                    audio_file = run_tts_preview(
-                        preview_text,
-                        st.session_state["speaker_1_voice"],
-                        params.voice_rate,
+                if os.path.exists(audio_file):
+                    audio_segments.append((audio_file, duration, segment_index))
+                    logger.info(f"   音频片段 {segment_index}: {duration:.2f}秒")
+                    segment_index += 1
+            
+            # Speaker 2 音频
+            if turn.speaker_2:
+                audio_path = os.path.join(output_dir, f"audio_segment_{segment_index}_speaker2.mp3")
+                audio_file, duration = asyncio.run(
+                    podcast_audio.podcast_audio_generator.generate_single_speaker_audio(
+                        text=turn.speaker_2,
+                        voice_name=turn.speaker_2_voice,
+                        output_path=audio_path,
+                        voice_rate=1.0,
+                        voice_volume=1.0
                     )
-                    if audio_file:
-                        st.audio(audio_file, format="audio/mp3")
-                        os.remove(audio_file)
-                    else:
-                        st.error(tr("语音试听生成失败"))
-
-        with preview_cols[1]:
-            if st.button(tr("试听说话人2")):
-                with st.spinner(tr("Synthesizing Voice")):
-                    audio_file = run_tts_preview(
-                        preview_text,
-                        st.session_state["speaker_2_voice"],
-                        params.voice_rate,
-                    )
-                    if audio_file:
-                        st.audio(audio_file, format="audio/mp3")
-                        os.remove(audio_file)
-                    else:
-                        st.error(tr("语音试听生成失败"))
-
-        # SiliconFlow API Key 配置
-        saved_siliconflow_api_key = config.siliconflow.get("api_key", "")
-        siliconflow_api_key = st.text_input(
-            tr("SiliconFlow API Key"),
-            value=saved_siliconflow_api_key,
-            type="password",
-            key="siliconflow_api_key_input",
-        )
-
-        # 显示 SiliconFlow 的说明信息
-        st.info(
-            tr("SiliconFlow TTS Settings")
-            + ":\n"
-            + "- "
-            + tr("Speed: Range [0.25, 4.0], default is 1.0")
-            + "\n"
-            + "- "
-            + tr("Volume: Uses Speech Volume setting, default 1.0 maps to gain 0")
-        )
-
-        config.siliconflow["api_key"] = siliconflow_api_key
-
-        params.voice_volume = st.selectbox(
-            tr("Speech Volume"),
-            options=[0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0],
-            index=2,
-        )
-
-        params.voice_rate = st.selectbox(
-            tr("Speech Rate"),
-            options=[0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.8, 2.0],
-            index=2,
-        )
-
-        bgm_options = [
-            (tr("No Background Music"), ""),
-            (tr("Random Background Music"), "random"),
-            (tr("Custom Background Music"), "custom"),
+                )
+                if os.path.exists(audio_file):
+                    audio_segments.append((audio_file, duration, segment_index))
+                    logger.info(f"   音频片段 {segment_index}: {duration:.2f}秒")
+                    segment_index += 1
+        
+        results["audio_segments"] = audio_segments
+        logger.info(f"✅ 共生成 {len(audio_segments)} 个音频片段")
+        
+        # 步骤4: 生成教育图片
+        st.info("🖼️ 正在生成教育图片...")
+        image_paths = []
+        image_index = 1
+        
+        for turn_idx, turn in enumerate(podcast_script, 1):
+            # Speaker 1 图片
+            if turn.speaker_1:
+                output_path = os.path.join(output_dir, f"image_{image_index}_speaker1.png")
+                result = generate_sentence_image(
+                    sentence=turn.speaker_1,
+                    keywords=video_terms,
+                    output_path=output_path
+                )
+                if result and os.path.exists(result):
+                    image_paths.append(result)
+                    logger.info(f"   图片 {image_index}: ✅")
+                    image_index += 1
+            
+            # Speaker 2 图片
+            if turn.speaker_2:
+                output_path = os.path.join(output_dir, f"image_{image_index}_speaker2.png")
+                result = generate_sentence_image(
+                    sentence=turn.speaker_2,
+                    keywords=video_terms,
+                    output_path=output_path
+                )
+                if result and os.path.exists(result):
+                    image_paths.append(result)
+                    logger.info(f"   图片 {image_index}: ✅")
+                    image_index += 1
+        
+        results["images"] = image_paths
+        logger.info(f"✅ 共生成 {len(image_paths)} 张图片")
+        
+        # 步骤5: 合成视频
+        st.info("🎬 正在合成视频...")
+        
+        # 匹配图片和音频
+        if len(image_paths) != len(audio_segments):
+            count = min(len(image_paths), len(audio_segments))
+            image_paths = image_paths[:count]
+            audio_segments = audio_segments[:count]
+        
+        # 创建视频片段
+        video_segments = []
+        aspect = VideoAspect.portrait
+        video_width, video_height = aspect.to_resolution()
+        
+        for i, (image_path, (audio_file, audio_duration, _)) in enumerate(zip(image_paths, audio_segments)):
+            segment_video = os.path.join(output_dir, f"segment_{i}.mp4")
+            
+            cmd = [
+                'ffmpeg', '-y',
+                '-loop', '1',
+                '-i', image_path,
+                '-i', audio_file,
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-vf', f'scale={video_width}:{video_height}',
+                '-t', str(audio_duration),
+                '-shortest',
+                '-threads', '2',
+                segment_video
+            ]
+            
+            subprocess.run(cmd, capture_output=True, text=True)
+            if os.path.exists(segment_video):
+                video_segments.append(segment_video)
+                logger.info(f"   片段 {i}: {audio_duration:.2f}秒 ✅")
+        
+        # 拼接视频片段
+        video_list_file = os.path.join(output_dir, "video_list.txt")
+        with open(video_list_file, "w") as f:
+            for video_path in video_segments:
+                f.write(f"file '{os.path.abspath(video_path)}'\n")
+        
+        final_video = os.path.join(output_dir, "final_video.mp4")
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat', '-safe', '0',
+            '-i', video_list_file,
+            '-c', 'copy',
+            final_video
         ]
-        selected_index = st.selectbox(
-            tr("Background Music"),
-            index=1,
-            options=range(
-                len(bgm_options)
-            ),  # Use the index as the internal option value
-            format_func=lambda x: bgm_options[x][
-                0
-            ],  # The label is displayed to the user
+        
+        subprocess.run(cmd, capture_output=True, text=True)
+        
+        # 清理临时文件
+        try:
+            os.remove(video_list_file)
+            for seg in video_segments:
+                os.remove(seg)
+        except:
+            pass
+        
+        if os.path.exists(final_video):
+            results["video_path"] = final_video
+            logger.info(f"✅ 视频生成成功: {final_video}")
+            results["success"] = True
+        else:
+            results["error"] = "视频合成失败"
+            
+    except Exception as e:
+        results["error"] = str(e)
+        logger.error(f"生成视频时出错: {e}")
+    
+    return results
+
+
+def format_script_preview(script: list) -> str:
+    """格式化脚本预览"""
+    lines = []
+    for i, turn in enumerate(script, 1):
+        lines.append(f"**第 {i} 轮对话**")
+        lines.append(f"👤 Speaker 1: {turn.speaker_1}")
+        lines.append(f"👤 Speaker 2: {turn.speaker_2}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ============ WebUI 界面 ============
+
+# 标题
+st.title("📚 教育视频生成器")
+st.caption("输入文章内容，自动生成带语音和解说的教育短视频")
+
+# 主布局
+main_col = st.columns([1, 2])[1]
+
+with main_col:
+    # 文章输入
+    st.subheader("📝 输入文章内容")
+    article_text = st.text_area(
+        "粘贴英文文章...",
+        height=200,
+        placeholder="请粘贴要转换为教育视频的英文文章内容...\n\n例如：\nThe Dragon Boat Festival is a traditional Chinese holiday..."
+    )
+    
+    # 示例文章按钮
+    if st.button("📋 使用示例文章", use_container_width=True):
+        article_text = """
+The Dragon Boat Festival is a traditional Chinese holiday celebrated on the fifth day of the fifth lunar month. 
+People gather along rivers to watch exciting dragon boat races. 
+Teams of paddlers row colorful dragon boats decorated with dragon heads and tails. 
+The rhythmic drumming keeps everyone in perfect sync as they race toward the finish line.
+Delicious zongzi, sticky rice dumplings wrapped in bamboo leaves, are eaten during this festival.
+The festival commemorates the ancient poet Qu Yuan, who lived over two thousand years ago.
+        """
+        st.session_state["article_text"] = article_text
+        st.rerun()
+    
+    # 保存到session state
+    st.session_state["article_text"] = article_text
+    
+    # 分隔线
+    st.divider()
+    
+    # 生成按钮
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        generate_btn = st.button(
+            "🚀 开始生成视频",
+            type="primary",
+            use_container_width=True,
+            disabled=not article_text.strip()
         )
-        # Get the selected background music type
-        params.bgm_type = bgm_options[selected_index][1]
-
-        # Show or hide components based on the selection
-        if params.bgm_type == "custom":
-            custom_bgm_file = st.text_input(
-                tr("Custom Background Music File"), key="custom_bgm_file_input"
-            )
-            if custom_bgm_file and os.path.exists(custom_bgm_file):
-                params.bgm_file = custom_bgm_file
-                # st.write(f":red[已选择自定义背景音乐]：**{custom_bgm_file}**")
-        params.bgm_volume = st.selectbox(
-            tr("Background Music Volume"),
-            options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            index=2,
+    
+    with col2:
+        clear_btn = st.button(
+            "🗑️ 清空",
+            use_container_width=True
         )
+    
+    if clear_btn:
+        st.session_state["article_text"] = ""
+        st.session_state["podcast_script"] = None
+        st.session_state["generation_complete"] = False
+        st.session_state["error_message"] = None
+        st.rerun()
+    
+    # 显示结果区域
+    results_container = st.container()
+    
+    with results_container:
+        # 如果有生成的脚本，显示预览
+        if st.session_state.get("podcast_script"):
+            st.divider()
+            st.subheader("📖 生成的对话脚本")
+            
+            for i, turn in enumerate(st.session_state["podcast_script"], 1):
+                with st.expander(f"第 {i} 轮对话", expanded=i==1):
+                    st.markdown(f"**👤 Speaker 1:**\n{turn.speaker_1}")
+                    st.markdown(f"**👤 Speaker 2:**\n{turn.speaker_2}")
+            
+            st.divider()
+        
+        # 显示关键词
+        if st.session_state.get("video_terms"):
+            st.subheader("🔑 关键词")
+            keywords_str = " | ".join(st.session_state["video_terms"])
+            st.info(keywords_str)
+            st.divider()
+        
+        # 显示视频预览
+        if st.session_state.get("video_path") and os.path.exists(st.session_state["video_path"]):
+            st.subheader("🎬 生成的视频")
+            
+            # 视频信息
+            video_size = os.path.getsize(st.session_state["video_path"]) / (1024 * 1024)
+            st.success(f"✅ 视频生成完成！文件大小: {video_size:.2f} MB")
+            
+            # 视频播放器
+            st.video(st.session_state["video_path"])
+            
+            # 下载按钮
+            video_filename = f"education_video_{int(time.time())}.mp4"
+            with open(st.session_state["video_path"], "rb") as f:
+                st.download_button(
+                    "📥 下载视频",
+                    f,
+                    file_name=video_filename,
+                    mime="video/mp4",
+                    use_container_width=True
+                )
+            
+            st.divider()
+        
+        # 显示错误信息
+        if st.session_state.get("error_message"):
+            st.error(f"❌ 生成失败: {st.session_state['error_message']}")
+            st.divider()
 
-with right_panel:
-    with st.container(border=True):
-        st.write(tr("Subtitle Settings"))
-        params.subtitle_enabled = st.checkbox(tr("Enable Subtitles"), value=True)
-        font_names = get_all_fonts()
-        saved_font_name = config.ui.get("font_name", "MicrosoftYaHeiBold.ttc")
-        saved_font_name_index = 0
-        if saved_font_name in font_names:
-            saved_font_name_index = font_names.index(saved_font_name)
-        params.font_name = st.selectbox(
-            tr("Font"), font_names, index=saved_font_name_index
-        )
-        config.ui["font_name"] = params.font_name
+# 处理生成
+if generate_btn and article_text.strip():
+    # 创建输出目录
+    task_id = f"task_{uuid4().hex[:8]}"
+    output_dir = os.path.join(root_dir, "storage", "tasks", task_id)
+    os.makedirs(output_dir, exist_ok=True)
+    st.session_state["task_output_dir"] = output_dir
+    
+    # 显示进度
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # 更新进度
+    progress_bar.progress(10)
+    status_text.text("📝 正在生成播客脚本...")
+    
+    # 运行生成流程
+    results = generate_podcast_video(article_text, output_dir)
+    
+    progress_bar.progress(100)
+    
+    if results["success"]:
+        st.session_state["podcast_script"] = results["script"]
+        st.session_state["video_terms"] = results["terms"]
+        st.session_state["video_path"] = results["video_path"]
+        st.session_state["generation_complete"] = True
+        st.session_state["error_message"] = None
+        
+        status_text.text("✅ 生成完成！")
+        st.balloons()
+        
+        # 滚动到结果区域
+        st.rerun()
+    else:
+        st.session_state["error_message"] = results["error"]
+        st.session_state["generation_complete"] = False
+        
+        status_text.text("❌ 生成失败")
+        st.error(results["error"])
 
-        subtitle_positions = [
-            (tr("Top"), "top"),
-            (tr("Center"), "center"),
-            (tr("Bottom"), "bottom"),
-            (tr("Custom"), "custom"),
-        ]
-        selected_index = st.selectbox(
-            tr("Position"),
-            index=2,
-            options=range(len(subtitle_positions)),
-            format_func=lambda x: subtitle_positions[x][0],
-        )
-        params.subtitle_position = subtitle_positions[selected_index][1]
-
-        if params.subtitle_position == "custom":
-            custom_position = st.text_input(
-                tr("Custom Position (% from top)"),
-                value="70.0",
-                key="custom_position_input",
-            )
-            try:
-                params.custom_position = float(custom_position)
-                if params.custom_position < 0 or params.custom_position > 100:
-                    st.error(tr("Please enter a value between 0 and 100"))
-            except ValueError:
-                st.error(tr("Please enter a valid number"))
-
-        font_cols = st.columns([0.3, 0.7])
-        with font_cols[0]:
-            saved_text_fore_color = config.ui.get("text_fore_color", "#FFFFFF")
-            params.text_fore_color = st.color_picker(
-                tr("Font Color"), saved_text_fore_color
-            )
-            config.ui["text_fore_color"] = params.text_fore_color
-
-        with font_cols[1]:
-            saved_font_size = config.ui.get("font_size", 60)
-            params.font_size = st.slider(tr("Font Size"), 30, 100, saved_font_size)
-            config.ui["font_size"] = params.font_size
-
-        stroke_cols = st.columns([0.3, 0.7])
-        with stroke_cols[0]:
-            params.stroke_color = st.color_picker(tr("Stroke Color"), "#000000")
-        with stroke_cols[1]:
-            params.stroke_width = st.slider(tr("Stroke Width"), 0.0, 10.0, 1.5)
-
-start_button = st.button(tr("生成播客视频"), use_container_width=True, type="primary")
-if start_button:
-    config.save_config()
-    task_id = str(uuid4())
-
-    # 播客模式验证
-    if not st.session_state["article_text"]:
-        st.error(tr("请输入文章内容"))
-        scroll_to_bottom()
-        st.stop()
-
-    if not st.session_state["podcast_script"]:
-        st.error(tr("请先生成播客对话"))
-        scroll_to_bottom()
-        st.stop()
-
-    # 设置播客相关参数
-    params.article_text = st.session_state["article_text"]
-    params.podcast_script = apply_selected_voices(st.session_state["podcast_script"])
-    params.speaker_1_voice = st.session_state["speaker_1_voice"]
-    params.speaker_2_voice = st.session_state["speaker_2_voice"]
-    params.video_terms = llm.generate_terms_from_podcast(params.podcast_script)
-
-    if params.video_source not in ["siliconflow"]:
-        st.error(tr("Please Select a Valid Video Source"))
-        scroll_to_bottom()
-        st.stop()
-
-    if uploaded_files:
-        local_videos_dir = utils.storage_dir("local_videos", create=True)
-        for file in uploaded_files:
-            file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
-            with open(file_path, "wb") as f:
-                f.write(file.getbuffer())
-                m = MaterialInfo()
-                m.provider = "local"
-                m.url = file_path
-                if not params.video_materials:
-                    params.video_materials = []
-                params.video_materials.append(m)
-
-    log_container = st.empty()
-    log_records = []
-
-    def log_received(msg):
-        if config.ui["hide_log"]:
-            return
-        with log_container:
-            log_records.append(msg)
-            st.code("\n".join(log_records))
-
-    logger.add(log_received)
-
-    st.toast(tr("Generating Video"))
-    logger.info(tr("Start Generating Video"))
-    logger.info(utils.to_json(params))
-    scroll_to_bottom()
-
-    result = tm.start(task_id=task_id, params=params)
-    if not result or "videos" not in result:
-        st.error(tr("Video Generation Failed"))
-        logger.error(tr("Video Generation Failed"))
-        scroll_to_bottom()
-        st.stop()
-
-    video_files = result.get("videos", [])
-    st.success(tr("Video Generation Completed"))
-    try:
-        if video_files:
-            player_cols = st.columns(len(video_files) * 2 + 1)
-            for i, url in enumerate(video_files):
-                player_cols[i * 2 + 1].video(url)
-    except Exception:
-        pass
-
-    open_task_folder(task_id)
-    logger.info(tr("Video Generation Completed"))
-    scroll_to_bottom()
-
-config.save_config()
+# 底部信息
+st.divider()
+st.caption("📚 教育视频生成器 - 基于 SiliconFlow API | 使用 apimart Gemini-3 生成图片")

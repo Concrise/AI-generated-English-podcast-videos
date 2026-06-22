@@ -46,6 +46,7 @@ whisper = _cfg.get("whisper", {})
 proxy = _cfg.get("proxy", {})
 azure = _cfg.get("azure", {})
 siliconflow = _cfg.get("siliconflow", {})
+apimart = _cfg.get("apimart", {})
 ui = _cfg.get(
     "ui",
     {

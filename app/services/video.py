@@ -4,6 +4,8 @@ import os
 import random
 import gc
 import shutil
+import subprocess
+import json
 from typing import List
 from loguru import logger
 from moviepy import (
@@ -145,6 +147,7 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
+    """使用 ffmpeg 命令行工具合成视频，提高效率"""
     if type(video_concat_mode) is str:
         video_concat_mode = VideoConcatMode(video_concat_mode)
     if type(video_transition_mode) is str:
@@ -152,198 +155,151 @@ def combine_videos(
     if video_transition_mode is None:
         video_transition_mode = VideoTransitionMode.none
 
-    audio_clip = AudioFileClip(audio_file)
-    audio_duration = audio_clip.duration
-    logger.info(f"audio duration: {audio_duration} seconds")
-    # Required duration of each clip
-    req_dur = audio_duration / len(video_paths)
-    req_dur = max_clip_duration
-    logger.info(f"maximum clip duration: {req_dur} seconds")
-    output_dir = os.path.dirname(combined_video_path)
+    # 获取音频时长
+    try:
+        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', audio_file]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        info = json.loads(result.stdout)
+        audio_duration = float(info['streams'][0]['duration'])
+        logger.info(f"audio duration: {audio_duration} seconds")
+    except Exception as e:
+        logger.warning(f"无法获取音频时长: {str(e)}")
+        audio_duration = 30
 
+    output_dir = os.path.dirname(combined_video_path)
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
 
-    processed_clips = []
-    subclipped_items = []
-    video_duration = 0
-    
-    for video_path in video_paths:
-        if is_image_file(video_path):
-            # 处理图片文件
-            clip_w, clip_h = get_image_size(video_path)
-            # 图片没有时长，使用最大剪辑时长作为默认时长
-            subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=0, end_time=max_clip_duration, width=clip_w, height=clip_h, duration=max_clip_duration))
-        else:
-            # 处理视频文件
-            clip = VideoFileClip(video_path)
-            clip_duration = clip.duration
-            clip_w, clip_h = clip.size
-            close_clip(clip)
-            
-            start_time = 0
+    # 过滤有效文件
+    valid_paths = [p for p in video_paths if os.path.exists(p)]
+    if not valid_paths:
+        logger.error("没有可用的视频/图片文件")
+        return combined_video_path
 
-            while start_time < clip_duration:
-                end_time = min(start_time + max_clip_duration, clip_duration)
-                if end_time > start_time:
-                    subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=start_time, end_time=end_time, width=clip_w, height=clip_h))
-                start_time = end_time
-                if video_concat_mode.value == VideoConcatMode.sequential.value:
-                    break
-
-    if video_concat_mode.value == VideoConcatMode.random.value:
-        random.shuffle(subclipped_items)
+    # 如果只有图片素材，将所有图片按顺序组合成视频
+    image_paths = [p for p in valid_paths if is_image_file(p)]
+    if image_paths:
+        logger.info(f"将 {len(image_paths)} 张图片按顺序组合成视频")
         
-    logger.debug(f"total subclipped items: {len(subclipped_items)}")
-    
-    for i, subclipped_item in enumerate(subclipped_items):
-        if video_duration > audio_duration:
-            break
+        # 计算每张图片的显示时长（平均分配音频时长）
+        images_count = len(image_paths)
+        image_duration = audio_duration / images_count
+        logger.info(f"音频时长: {audio_duration:.2f}s, 图片数量: {images_count}, 每张图片显示: {image_duration:.2f}s")
         
-        logger.debug(f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, current duration: {video_duration:.2f}s, remaining: {audio_duration - video_duration:.2f}s")
+        # 创建图片列表文件（用于 ffmpeg concat）
+        image_list_file = os.path.join(output_dir, "image_list.txt")
+        with open(image_list_file, "w") as f:
+            for img_path in image_paths:
+                f.write(f"file '{os.path.abspath(img_path)}'\n")
+                f.write(f"duration {image_duration:.2f}\n")
+        
+        # 使用 ffmpeg concat 滤镜将图片按顺序组合
+        temp_video = os.path.join(output_dir, "temp_image_video.mp4")
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat', '-safe', '0',
+            '-i', image_list_file,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-vf', f'scale={video_width}:{video_height}',
+            '-r', '30',
+            '-threads', str(threads),
+            temp_video
+        ]
         
         try:
-            if is_image_file(subclipped_item.file_path):
-                # 处理图片
-                clip = ImageClip(subclipped_item.file_path).with_duration(max_clip_duration)
-                clip_duration = max_clip_duration
-                clip_w, clip_h = clip.size
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"图片组合失败: {result.stderr}")
+                return combined_video_path
+        except Exception as e:
+            logger.error(f"图片组合异常: {str(e)}")
+            return combined_video_path
+        
+        # 添加音频
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', temp_video,
+            '-i', audio_file,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-shortest',
+            '-threads', str(threads),
+            combined_video_path
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info(f"视频合成完成: {combined_video_path}")
             else:
-                # 处理视频
-                clip = VideoFileClip(subclipped_item.file_path).subclipped(subclipped_item.start_time, subclipped_item.end_time)
-                clip_duration = clip.duration
-                clip_w, clip_h = clip.size
-            
-            # 调整尺寸
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if video_transition_mode.value == VideoTransitionMode.none.value:
-                clip = clip
-            elif video_transition_mode.value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif video_transition_mode.value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif video_transition_mode.value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif video_transition_mode.value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif video_transition_mode.value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
-
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            clip_duration = clip.duration
-            clip.write_videofile(clip_file, logger=None, fps=fps, codec=video_codec)
-            close_clip(clip)
-        
-            processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip_duration, width=clip_w, height=clip_h))
-            video_duration += clip_duration
-            
+                logger.error(f"添加音频失败: {result.stderr}")
         except Exception as e:
-            logger.error(f"failed to process clip: {str(e)}")
-    
-    # loop processed clips until the video duration matches or exceeds the audio duration.
-    if video_duration < audio_duration:
-        logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
-        base_clips = processed_clips.copy()
-        for clip in itertools.cycle(base_clips):
-            if video_duration >= audio_duration:
-                break
-            processed_clips.append(clip)
-            video_duration += clip.duration
-        logger.info(f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, looped {len(processed_clips)-len(base_clips)} clips")
-     
-    # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
-    logger.info("starting clip merging process")
-    if not processed_clips:
-        logger.warning("no clips available for merging")
-        return combined_video_path
-    
-    # if there is only one clip, use it directly
-    if len(processed_clips) == 1:
-        logger.info("using single clip directly")
-        shutil.copy(processed_clips[0].file_path, combined_video_path)
-        delete_files([clip.file_path for clip in processed_clips])
-        logger.info("video combining completed")
-        return combined_video_path
-    
-    # create initial video file as base
-    base_clip_path = processed_clips[0].file_path
-    temp_merged_video = f"{output_dir}/temp-merged-video.mp4"
-    temp_merged_next = f"{output_dir}/temp-merged-next.mp4"
-    
-    # copy first clip as initial merged video
-    shutil.copy(base_clip_path, temp_merged_video)
-    
-    # merge remaining video clips one by one
-    for i, clip in enumerate(processed_clips[1:], 1):
-        logger.info(f"merging clip {i}/{len(processed_clips)-1}, duration: {clip.duration:.2f}s")
+            logger.error(f"添加音频异常: {str(e)}")
         
-        try:
-            # load current base video and next clip to merge
-            base_clip = VideoFileClip(temp_merged_video)
-            next_clip = VideoFileClip(clip.file_path)
-            
-            # merge these two clips
-            merged_clip = concatenate_videoclips([base_clip, next_clip])
+        # 清理临时文件
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
+        if os.path.exists(image_list_file):
+            os.remove(image_list_file)
+        
+        return combined_video_path
 
-            # save merged result to temp file
-            merged_clip.write_videofile(
-                filename=temp_merged_next,
-                threads=threads,
-                logger=None,
-                temp_audiofile_path=output_dir,
-                audio_codec=audio_codec,
-                fps=fps,
-            )
-            close_clip(base_clip)
-            close_clip(next_clip)
-            close_clip(merged_clip)
-            
-            # replace base file with new merged file
-            delete_files(temp_merged_video)
-            os.rename(temp_merged_next, temp_merged_video)
-            
-        except Exception as e:
-            logger.error(f"failed to merge clip: {str(e)}")
-            continue
+    # 如果有视频文件，使用视频处理逻辑
+    # 创建视频列表文件
+    video_list_file = os.path.join(output_dir, "video_list.txt")
+    with open(video_list_file, "w") as f:
+        for video_path in valid_paths:
+            f.write(f"file '{os.path.abspath(video_path)}'\n")
+
+    # 使用 ffmpeg concat 滤镜合并视频
+    temp_concat = os.path.join(output_dir, "temp_concat.mp4")
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat', '-safe', '0',
+        '-i', video_list_file,
+        '-c', 'copy',
+        '-threads', str(threads),
+        temp_concat
+    ]
     
-    # after merging, rename final result to target file name
-    os.rename(temp_merged_video, combined_video_path)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"视频合并失败: {result.stderr}")
+            return combined_video_path
+    except Exception as e:
+        logger.error(f"视频合并异常: {str(e)}")
+        return combined_video_path
+
+    # 添加音频并调整尺寸
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', temp_concat,
+        '-i', audio_file,
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-vf', f'scale={video_width}:{video_height}',
+        '-shortest',
+        '-threads', str(threads),
+        combined_video_path
+    ]
     
-    # clean temp files
-    clip_files = [clip.file_path for clip in processed_clips]
-    delete_files(clip_files)
-            
-    logger.info("video combining completed")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"视频合成完成: {combined_video_path}")
+        else:
+            logger.error(f"视频合成失败: {result.stderr}")
+    except Exception as e:
+        logger.error(f"视频合成异常: {str(e)}")
+
+    # 清理临时文件
+    if os.path.exists(temp_concat):
+        os.remove(temp_concat)
+    if os.path.exists(video_list_file):
+        os.remove(video_list_file)
+
     return combined_video_path
 
 
