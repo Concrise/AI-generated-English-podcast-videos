@@ -1,44 +1,46 @@
-from fastapi import Request
+from fastapi import Depends, Request
 
+from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.schema import (
-    VideoScriptRequest,
-    VideoScriptResponse,
-    VideoTermsRequest,
-    VideoTermsResponse,
+    PodcastScriptRequest,
+    PodcastScriptResponse,
+    PodcastTermsRequest,
+    PodcastTermsResponse,
 )
 from app.services import llm
 from app.utils import utils
 
 # authentication dependency
-# router = new_router(dependencies=[Depends(base.verify_token)])
-router = new_router()
+router = new_router(dependencies=[Depends(base.verify_token)])
 
 
 @router.post(
     "/scripts",
-    response_model=VideoScriptResponse,
-    summary="Create a script for the video",
+    response_model=PodcastScriptResponse,
+    summary="Create a podcast script from article text",
 )
-def generate_video_script(request: Request, body: VideoScriptRequest):
-    video_script = llm.generate_script(
-        video_subject=body.video_subject,
-        language=body.video_language,
-        paragraph_number=body.paragraph_number,
+def generate_podcast_script(request: Request, body: PodcastScriptRequest):
+    podcast_script = llm.generate_podcast_script(
+        article_text=body.article_text,
+        language=body.language,
     )
-    response = {"video_script": video_script}
+    for item in podcast_script:
+        item.speaker_1_voice = body.speaker_1_voice or item.speaker_1_voice
+        item.speaker_2_voice = body.speaker_2_voice or item.speaker_2_voice
+
+    response = {"podcast_script": podcast_script}
     return utils.get_response(200, response)
 
 
 @router.post(
     "/terms",
-    response_model=VideoTermsResponse,
-    summary="Generate video terms based on the video script",
+    response_model=PodcastTermsResponse,
+    summary="Generate material search terms from a podcast script",
 )
-def generate_video_terms(request: Request, body: VideoTermsRequest):
-    video_terms = llm.generate_terms(
-        video_subject=body.video_subject,
-        video_script=body.video_script,
+def generate_podcast_terms(request: Request, body: PodcastTermsRequest):
+    video_terms = llm.generate_terms_from_podcast(
+        podcast_script=body.podcast_script,
         amount=body.amount,
     )
     response = {"video_terms": video_terms}

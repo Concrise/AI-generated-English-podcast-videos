@@ -11,7 +11,20 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.utils import utils
 
+# 图片生成服务
+try:
+    from app.services.image_generator import generate_word_image, generate_educational_image, extract_words_with_phonetics
+except ImportError:
+    logger.warning("image_generator module not found, image generation features disabled")
+    generate_word_image = None
+    generate_educational_image = None
+    extract_words_with_phonetics = None
+
 requested_count = 0
+
+
+def request_verify_ssl() -> bool:
+    return bool(config.app.get("verify_ssl", True))
 
 
 def get_api_key(cfg_key: str):
@@ -54,9 +67,10 @@ def search_videos_pexels(
             query_url,
             headers=headers,
             proxies=config.proxy,
-            verify=False,
+            verify=request_verify_ssl(),
             timeout=(30, 60),
         )
+        r.raise_for_status()
         response = r.json()
         video_items = []
         if "videos" not in response:
@@ -110,9 +124,11 @@ def search_videos_pixabay(
 
     try:
         r = requests.get(
-            query_url, proxies=config.proxy, verify=False, timeout=(30, 60)
+            query_url, proxies=config.proxy, verify=request_verify_ssl(), timeout=(30, 60)
         )
+        r.raise_for_status()
         response = r.json()
+
         video_items = []
         if "hits" not in response:
             logger.error(f"search videos failed: {response}")
@@ -166,16 +182,16 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     }
 
     # if video does not exist, download it
+    response = requests.get(
+        video_url,
+        headers=headers,
+        proxies=config.proxy,
+        verify=request_verify_ssl(),
+        timeout=(60, 240),
+    )
+    response.raise_for_status()
     with open(video_path, "wb") as f:
-        f.write(
-            requests.get(
-                video_url,
-                headers=headers,
-                proxies=config.proxy,
-                verify=False,
-                timeout=(60, 240),
-            ).content
-        )
+        f.write(response.content)
 
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         try:
@@ -202,7 +218,6 @@ def download_videos(
     video_contact_mode: VideoConcatMode = VideoConcatMode.random,
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
-    is_podcast_mode: bool = False,
 ) -> List[str]:
     valid_video_items = []
     valid_video_urls = []
@@ -211,10 +226,8 @@ def download_videos(
     if source == "pixabay":
         search_videos = search_videos_pixabay
 
-    # 如果是播客模式，优化搜索词
-    if is_podcast_mode:
-        search_terms = optimize_podcast_search_terms(search_terms)
-        logger.info(f"optimized podcast search terms: {search_terms}")
+    search_terms = optimize_podcast_search_terms(search_terms)
+    logger.info(f"optimized podcast search terms: {search_terms}")
 
     for search_term in search_terms:
         video_items = search_videos(
@@ -303,6 +316,100 @@ def optimize_podcast_search_terms(search_terms: List[str]) -> List[str]:
     # 去重并限制数量
     unique_terms = list(set(optimized_terms))
     return unique_terms[:15]  # 限制最多15个搜索词
+
+
+def generate_image_materials(
+    task_id: str,
+    script: list,
+    keywords: List[str],
+    audio_duration: float = 0.0,
+    max_images: int = 5,
+) -> List[str]:
+    """
+    使用 SiliconFlow 图片生成 API 生成教育英文单词标注图片作为视频素材
+    
+    Args:
+        task_id: 任务ID
+        script: 播客脚本列表
+        keywords: 关键词列表
+        audio_duration: 音频时长（秒）
+        max_images: 最大生成图片数量
+        
+    Returns:
+        生成的图片文件路径列表
+    """
+    if generate_word_image is None:
+        logger.error("image_generator module not available")
+        return []
+    
+    image_paths = []
+    task_dir = utils.task_dir(task_id)
+    images_dir = os.path.join(task_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    # 从脚本中提取单词
+    all_text = ""
+    for turn in script:
+        if hasattr(turn, 'speaker_1'):
+            all_text += " " + turn.speaker_1
+        if hasattr(turn, 'speaker_2'):
+            all_text += " " + turn.speaker_2
+        elif isinstance(turn, dict):
+            if 'speaker_1' in turn:
+                all_text += " " + turn['speaker_1']
+            if 'speaker_2' in turn:
+                all_text += " " + turn['speaker_2']
+    
+    # 提取单词及其音标
+    words = extract_words_with_phonetics(all_text)
+    logger.info(f"Extracted {len(words)} words from script")
+    
+    # 使用关键词补充
+    for keyword in keywords[:5]:
+        words.append((keyword, "", ""))
+    
+    # 去重
+    seen_words = set()
+    unique_words = []
+    for word, phonetic, definition in words:
+        word_lower = word.lower()
+        if word_lower not in seen_words:
+            seen_words.add(word_lower)
+            unique_words.append((word, phonetic, definition))
+    
+    # 生成图片
+    generated_count = 0
+    for word, phonetic, definition in unique_words[:max_images]:
+        output_path = os.path.join(images_dir, f"word_{word.lower()}.png")
+        
+        # 如果图片已存在，跳过
+        if os.path.exists(output_path):
+            image_paths.append(output_path)
+            generated_count += 1
+            continue
+        
+        # 生成图片
+        logger.info(f"Generating image for word: {word} /{phonetic}/")
+        result = generate_word_image(word, phonetic, definition, output_path)
+        
+        if result:
+            image_paths.append(result)
+            generated_count += 1
+            
+            # 如果已经生成了足够的图片，停止
+            if generated_count >= max_images:
+                break
+    
+    # 如果没有生成任何图片，生成一个通用教育图片
+    if not image_paths and keywords:
+        topic = keywords[0] if keywords else "English Learning"
+        output_path = os.path.join(images_dir, f"educational_{topic.lower()}.png")
+        result = generate_educational_image(topic, keywords[:3], output_path)
+        if result:
+            image_paths.append(result)
+    
+    logger.success(f"Generated {len(image_paths)} images for task {task_id}")
+    return image_paths
 
 
 if __name__ == "__main__":

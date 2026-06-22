@@ -1,6 +1,12 @@
 import asyncio
 import unittest
 import os
+
+import pytest
+
+pytestmark = pytest.mark.integration
+if os.getenv("RUN_INTEGRATION_TESTS") != "1":
+    pytest.skip("integration test skipped by default", allow_module_level=True)
 import sys
 from pathlib import Path
 

@@ -109,6 +109,9 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
         suffix = "*.mp3"
         song_dir = utils.song_dir()
         files = glob.glob(os.path.join(song_dir, suffix))
+        if not files:
+            logger.warning(f"no bgm files found in {song_dir}")
+            return ""
         return random.choice(files)
 
     return ""
@@ -120,10 +123,17 @@ def combine_videos(
     audio_file: str,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
-    video_transition_mode: VideoTransitionMode = None,
+    video_transition_mode: VideoTransitionMode = VideoTransitionMode.none,
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
+    if type(video_concat_mode) is str:
+        video_concat_mode = VideoConcatMode(video_concat_mode)
+    if type(video_transition_mode) is str:
+        video_transition_mode = VideoTransitionMode(video_transition_mode)
+    if video_transition_mode is None:
+        video_transition_mode = VideoTransitionMode.none
+
     audio_clip = AudioFileClip(audio_file)
     audio_duration = audio_clip.duration
     logger.info(f"audio duration: {audio_duration} seconds")
@@ -148,10 +158,10 @@ def combine_videos(
         start_time = 0
 
         while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)            
-            if clip_duration - start_time >= max_clip_duration:
-                subclipped_items.append(SubClippedVideoClip(file_path= video_path, start_time=start_time, end_time=end_time, width=clip_w, height=clip_h))
-            start_time = end_time    
+            end_time = min(start_time + max_clip_duration, clip_duration)
+            if end_time > start_time:
+                subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=start_time, end_time=end_time, width=clip_w, height=clip_h))
+            start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
 
@@ -219,12 +229,12 @@ def combine_videos(
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            clip_duration = clip.duration
             clip.write_videofile(clip_file, logger=None, fps=fps, codec=video_codec)
-            
             close_clip(clip)
         
-            processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip.duration, width=clip_w, height=clip_h))
-            video_duration += clip.duration
+            processed_clips.append(SubClippedVideoClip(file_path=clip_file, duration=clip_duration, width=clip_w, height=clip_h))
+            video_duration += clip_duration
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
@@ -250,7 +260,7 @@ def combine_videos(
     if len(processed_clips) == 1:
         logger.info("using single clip directly")
         shutil.copy(processed_clips[0].file_path, combined_video_path)
-        delete_files(processed_clips)
+        delete_files([clip.file_path for clip in processed_clips])
         logger.info("video combining completed")
         return combined_video_path
     

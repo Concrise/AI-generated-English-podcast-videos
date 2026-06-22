@@ -4,8 +4,6 @@ FROM python:3.11-slim-bullseye
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
 
-# 设置/MoneyPrinterTurbo目录权限为777
-RUN chmod 777 /MoneyPrinterTurbo
 
 ENV PYTHONPATH="/MoneyPrinterTurbo"
 
@@ -32,7 +30,7 @@ COPY . .
 EXPOSE 8501
 
 # Command to run the application
-CMD ["streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False"]
+CMD ["streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False"]
 
 # 1. Build the Docker image using the following command
 # docker build -t moneyprinterturbo .

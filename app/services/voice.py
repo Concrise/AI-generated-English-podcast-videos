@@ -8,22 +8,83 @@ from xml.sax.saxutils import unescape
 import edge_tts
 import requests
 from edge_tts import SubMaker, submaker
-from edge_tts.submaker import mktimestamp
 from loguru import logger
 from moviepy.video.tools import subtitles
 
 from app.config import config
 from app.utils import utils
 
+def mktimestamp(seconds: float) -> str:
+    """
+    Convert seconds to SRT timestamp format (HH:MM:SS.mmm)
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    milliseconds = int((secs - int(secs)) * 1000)
+    secs = int(secs)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
 
 def get_siliconflow_voices() -> list[str]:
     """
-    获取硅基流动的声音列表
+    获取硅基流动的声音列表（从API获取）
 
     Returns:
-        声音列表，格式为 ["siliconflow:FunAudioLLM/CosyVoice2-0.5B:alex", ...]
+        声音列表，格式为 ["siliconflow:model:voice-Gender", ...]
     """
-    # 硅基流动的声音列表和对应的性别（用于显示）
+    api_key = config.siliconflow.get("api_key", "")
+    
+    if not api_key:
+        logger.warning("SiliconFlow API key is not set, using default voices")
+        # 返回默认声音列表
+        voices_with_gender = [
+            ("FunAudioLLM/CosyVoice2-0.5B", "alex", "Male"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "anna", "Female"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "bella", "Female"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "benjamin", "Male"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "charles", "Male"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "claire", "Female"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "david", "Male"),
+            ("FunAudioLLM/CosyVoice2-0.5B", "diana", "Female"),
+        ]
+        return [
+            f"siliconflow:{model}:{voice}-{gender}"
+            for model, voice, gender in voices_with_gender
+        ]
+    
+    try:
+        url = "https://api.siliconflow.cn/v1/audio/voice/list"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            voices = []
+            
+            if data and isinstance(data, list):
+                for voice_info in data:
+                    model = voice_info.get("model", "")
+                    voice = voice_info.get("voice", "")
+                    gender = voice_info.get("gender", "").capitalize()
+                    
+                    if model and voice:
+                        display_gender = gender if gender else "Unknown"
+                        voices.append(f"siliconflow:{model}:{voice}-{display_gender}")
+            
+            if voices:
+                logger.info(f"Successfully fetched {len(voices)} voices from SiliconFlow")
+                return voices
+            else:
+                logger.warning("No voices found in SiliconFlow response")
+        else:
+            logger.error(f"Failed to fetch voices from SiliconFlow: {response.status_code}")
+    
+    except Exception as e:
+        logger.error(f"Error fetching voices from SiliconFlow: {str(e)}")
+    
+    # 如果API调用失败，返回默认声音列表
     voices_with_gender = [
         ("FunAudioLLM/CosyVoice2-0.5B", "alex", "Male"),
         ("FunAudioLLM/CosyVoice2-0.5B", "anna", "Female"),
@@ -34,8 +95,6 @@ def get_siliconflow_voices() -> list[str]:
         ("FunAudioLLM/CosyVoice2-0.5B", "david", "Male"),
         ("FunAudioLLM/CosyVoice2-0.5B", "diana", "Female"),
     ]
-
-    # 添加siliconflow:前缀，并格式化为显示名称
     return [
         f"siliconflow:{model}:{voice}-{gender}"
         for model, voice, gender in voices_with_gender
@@ -1137,8 +1196,9 @@ async def azure_tts_v1(
                             (chunk["offset"], chunk["duration"]), chunk["text"]
                         )
 
-            if not sub_maker or not sub_maker.subs:
-                logger.warning("failed, sub_maker is None or sub_maker.subs is None")
+            # 检查文件是否成功生成
+            if not os.path.exists(voice_file) or os.path.getsize(voice_file) == 0:
+                logger.warning("failed, audio file not generated or empty")
                 continue
 
             logger.info(f"completed, output file: {voice_file}")

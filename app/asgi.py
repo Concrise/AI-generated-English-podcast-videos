@@ -54,18 +54,19 @@ app = get_application()
 
 # Configures the CORS middleware for the FastAPI app
 cors_allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-origins = cors_allowed_origins_str.split(",") if cors_allowed_origins_str else ["*"]
+origins = [origin.strip() for origin in cors_allowed_origins_str.split(",") if origin.strip()]
+allow_credentials = bool(origins and "*" not in origins)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins or ["*"],
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 task_dir = utils.task_dir()
 app.mount(
-    "/tasks", StaticFiles(directory=task_dir, html=True, follow_symlink=True), name=""
+    "/tasks", StaticFiles(directory=task_dir, html=True, follow_symlink=False), name=""
 )
 
 public_dir = utils.public_dir()

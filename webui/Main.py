@@ -1,3 +1,4 @@
+import asyncio
 import os
 import platform
 import sys
@@ -61,10 +62,6 @@ config_file = os.path.join(root_dir, "webui", ".streamlit", "webui.toml")
 system_locale = utils.get_system_locale()
 
 
-if "video_subject" not in st.session_state:
-    st.session_state["video_subject"] = ""
-if "video_script" not in st.session_state:
-    st.session_state["video_script"] = ""
 if "video_terms" not in st.session_state:
     st.session_state["video_terms"] = ""
 if "ui_language" not in st.session_state:
@@ -153,27 +150,41 @@ def open_task_folder(task_id):
         logger.error(e)
 
 
-def _format_podcast_to_script(podcast_script: List[PodcastScript]) -> str:
-    """
-    将播客脚本格式化为传统脚本格式
-
-    Args:
-        podcast_script: 播客脚本列表
-
-    Returns:
-        格式化后的脚本字符串
-    """
+def _format_podcast_script(podcast_script: List[PodcastScript]) -> str:
+    """将播客对话脚本格式化为便于预览的文本。"""
     if not podcast_script:
         return ""
 
     script_lines = []
     for i, dialogue in enumerate(podcast_script):
-        script_lines.append(f"说话人1: {dialogue.speaker_1}")
-        script_lines.append(f"说话人2: {dialogue.speaker_2}")
+        script_lines.append(f"第 {i + 1} 轮")
+        script_lines.append(f"A: {dialogue.speaker_1}")
+        script_lines.append(f"B: {dialogue.speaker_2}")
         if i < len(podcast_script) - 1:
-            script_lines.append("")  # 添加空行分隔
+            script_lines.append("")
 
     return "\n".join(script_lines)
+
+
+def apply_selected_voices(podcast_script: List[PodcastScript]) -> List[PodcastScript]:
+    for dialogue in podcast_script or []:
+        dialogue.speaker_1_voice = st.session_state["speaker_1_voice"]
+        dialogue.speaker_2_voice = st.session_state["speaker_2_voice"]
+    return podcast_script
+
+
+def run_tts_preview(text: str, voice_name: str, voice_rate: float) -> str:
+    temp_dir = utils.storage_dir("temp", create=True)
+    audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
+    asyncio.run(
+        voice.tts(
+            text=text,
+            voice_name=voice_name,
+            voice_rate=voice_rate,
+            voice_file=audio_file,
+        )
+    )
+    return audio_file if os.path.exists(audio_file) else ""
 
 
 def scroll_to_bottom():
@@ -505,7 +516,7 @@ left_panel = panel[0]
 middle_panel = panel[1]
 right_panel = panel[2]
 
-params = VideoParams(video_subject="")
+params = VideoParams()
 uploaded_files = []
 
 with left_panel:
@@ -600,8 +611,8 @@ with left_panel:
                     )
 
                     if podcast_script:
+                        podcast_script = apply_selected_voices(podcast_script)
                         st.session_state["podcast_script"] = podcast_script
-                        st.session_state["video_script"] = _format_podcast_to_script(podcast_script)
                         st.success(tr("播客对话生成成功！"))
 
                         # 显示生成的对话预览
@@ -617,13 +628,13 @@ with left_panel:
                 except Exception as e:
                     st.error(tr(f"生成播客对话时出错: {str(e)}"))
 
-        # 显示生成的脚本（只读）
-        if st.session_state["video_script"]:
-            st.subheader(tr("生成的视频脚本"))
+        # 显示生成的播客脚本（只读）
+        if st.session_state["podcast_script"]:
+            st.subheader(tr("生成的播客脚本"))
             st.text_area(
-                tr("视频脚本"),
-                value=st.session_state["video_script"],
-                height=200,
+                tr("播客脚本"),
+                value=_format_podcast_script(st.session_state["podcast_script"]),
+                height=240,
                 disabled=True
             )
 
@@ -643,7 +654,7 @@ with middle_panel:
             (tr("Xiaohongshu"), "xiaohongshu"),
         ]
 
-        saved_video_source_name = config.app.get("video_source", "pexels")
+        saved_video_source_name = config.app.get("video_source", "local")
         saved_video_source_index = [v[1] for v in video_sources].index(
             saved_video_source_name
         )
@@ -769,87 +780,47 @@ with middle_panel:
                     if "V2" not in v:
                         filtered_voices.append(v)
 
-        friendly_names = {
-            v: v.replace("Female", tr("Female"))
-            .replace("Male", tr("Male"))
-            .replace("Neural", "")
-            for v in filtered_voices
-        }
-
-        saved_voice_name = config.ui.get("voice_name", "")
-        saved_voice_name_index = 0
-
-        # 检查保存的声音是否在当前筛选的声音列表中
-        if saved_voice_name in friendly_names:
-            saved_voice_name_index = list(friendly_names.keys()).index(saved_voice_name)
-        else:
-            # 如果不在，则根据当前UI语言选择一个默认声音
-            for i, v in enumerate(filtered_voices):
-                if v.lower().startswith(st.session_state["ui_language"].lower()):
-                    saved_voice_name_index = i
-                    break
-
-        # 如果没有找到匹配的声音，使用第一个声音
-        if saved_voice_name_index >= len(friendly_names) and friendly_names:
-            saved_voice_name_index = 0
-
-        # 确保有声音可选
-        if friendly_names:
-            selected_friendly_name = st.selectbox(
-                tr("Speech Synthesis"),
-                options=list(friendly_names.values()),
-                index=min(saved_voice_name_index, len(friendly_names) - 1)
-                if friendly_names
-                else 0,
-            )
-
-            voice_name = list(friendly_names.keys())[
-                list(friendly_names.values()).index(selected_friendly_name)
-            ]
-            params.voice_name = voice_name
-            config.ui["voice_name"] = voice_name
-        else:
-            # 如果没有声音可选，显示提示信息
+        voice_name = st.session_state["speaker_1_voice"]
+        if not filtered_voices:
             st.warning(
                 tr(
                     "No voices available for the selected TTS server. Please select another server."
                 )
             )
-            params.voice_name = ""
-            config.ui["voice_name"] = ""
 
-        # 只有在有声音可选时才显示试听按钮
-        if friendly_names and st.button(tr("Play Voice")):
-            play_content = params.video_subject
-            if not play_content:
-                play_content = params.video_script
-            if not play_content:
-                play_content = tr("Voice Example")
-            with st.spinner(tr("Synthesizing Voice")):
-                temp_dir = utils.storage_dir("temp", create=True)
-                audio_file = os.path.join(temp_dir, f"tmp-voice-{str(uuid4())}.mp3")
-                sub_maker = voice.tts(
-                    text=play_content,
-                    voice_name=voice_name,
-                    voice_rate=params.voice_rate,
-                    voice_file=audio_file,
-                    voice_volume=params.voice_volume,
-                )
-                # if the voice file generation failed, try again with a default content.
-                if not sub_maker:
-                    play_content = "This is a example voice. if you hear this, the voice synthesis failed with the original content."
-                    sub_maker = voice.tts(
-                        text=play_content,
-                        voice_name=voice_name,
-                        voice_rate=params.voice_rate,
-                        voice_file=audio_file,
-                        voice_volume=params.voice_volume,
+        preview_cols = st.columns(2)
+        preview_text = tr("Voice Example")
+        if st.session_state["podcast_script"]:
+            first_dialogue = st.session_state["podcast_script"][0]
+            preview_text = first_dialogue.speaker_1 or first_dialogue.speaker_2 or preview_text
+
+        with preview_cols[0]:
+            if st.button(tr("试听说话人1")):
+                with st.spinner(tr("Synthesizing Voice")):
+                    audio_file = run_tts_preview(
+                        preview_text,
+                        st.session_state["speaker_1_voice"],
+                        params.voice_rate,
                     )
-
-                if sub_maker and os.path.exists(audio_file):
-                    st.audio(audio_file, format="audio/mp3")
-                    if os.path.exists(audio_file):
+                    if audio_file:
+                        st.audio(audio_file, format="audio/mp3")
                         os.remove(audio_file)
+                    else:
+                        st.error(tr("语音试听生成失败"))
+
+        with preview_cols[1]:
+            if st.button(tr("试听说话人2")):
+                with st.spinner(tr("Synthesizing Voice")):
+                    audio_file = run_tts_preview(
+                        preview_text,
+                        st.session_state["speaker_2_voice"],
+                        params.voice_rate,
+                    )
+                    if audio_file:
+                        st.audio(audio_file, format="audio/mp3")
+                        os.remove(audio_file)
+                    else:
+                        st.error(tr("语音试听生成失败"))
 
         # 当选择V2版本或者声音是V2声音时，显示服务区域和API key输入框
         if selected_tts_server == "azure-tts-v2" or (
@@ -1018,12 +989,11 @@ if start_button:
         st.stop()
 
     # 设置播客相关参数
-    params.podcast_mode = True
     params.article_text = st.session_state["article_text"]
-    params.podcast_script = st.session_state["podcast_script"]
+    params.podcast_script = apply_selected_voices(st.session_state["podcast_script"])
     params.speaker_1_voice = st.session_state["speaker_1_voice"]
     params.speaker_2_voice = st.session_state["speaker_2_voice"]
-    params.video_terms = llm.generate_terms_from_podcast(st.session_state["podcast_script"])
+    params.video_terms = llm.generate_terms_from_podcast(params.podcast_script)
 
     if params.video_source not in ["pexels", "pixabay", "local"]:
         st.error(tr("Please Select a Valid Video Source"))

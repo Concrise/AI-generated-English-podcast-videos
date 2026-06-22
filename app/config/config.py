@@ -10,9 +10,8 @@ config_file = f"{root_dir}/config.toml"
 
 
 def load_config():
-    # fix: IsADirectoryError: [Errno 21] Is a directory: '/MoneyPrinterTurbo/config.toml'
     if os.path.isdir(config_file):
-        shutil.rmtree(config_file)
+        raise RuntimeError(f"config path is a directory, expected file: {config_file}")
 
     if not os.path.isfile(config_file):
         example_file = f"{root_dir}/config.example.toml"

@@ -60,23 +60,25 @@
 #### ① 克隆代码
 
 ```shell
-git https://github.com/liangdabiao/AI-generated-English-podcast-videos.git
+git clone https://github.com/liangdabiao/AI-generated-English-podcast-videos.git
 ```
 
 #### ② 修改配置文件（可选，建议启动后也可以在 WebUI 里面配置）
 
 - 将 `config.example.toml` 文件复制一份，命名为 `config.toml`
-- 按照 `config.toml` 文件中的说明，配置好 `pexels_api_keys` 和 `llm_provider`，并根据 llm_provider 对应的服务商，配置相关的
-  API Key
+- 配置 `llm_provider`，并填写对应服务商的 API Key（如 `moonshot_api_key`、`openai_api_key` 或 `deepseek_api_key`）
+- 选择在线视频素材时，至少配置一个素材 Key：`pexels_api_keys` 或 `pixabay_api_keys`
+- 如果选择 Azure TTS V2，需要配置 `[azure] speech_key` 和 `speech_region`；如果选择 SiliconFlow TTS，需要配置 `[siliconflow] api_key`
+- 本项目只保留播客视频生成流程：文章内容 → 双人播客脚本 → 素材关键词 → 双人音频 → 字幕 → 最终视频
  
 
 #### ② 访问Web界面
 
-打开浏览器，访问 http://0.0.0.0:8501
+打开浏览器，访问 http://127.0.0.1:8501
 
 #### ③ 访问API文档
 
-打开浏览器，访问 http://0.0.0.0:8080/docs 或者 http://0.0.0.0:8080/redoc
+打开浏览器，访问 http://127.0.0.1:8080/docs 或者 http://127.0.0.1:8080/redoc
 
 ### 手动部署 📦
 

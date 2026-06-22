@@ -1,3 +1,4 @@
+import secrets
 from uuid import uuid4
 
 from fastapi import Request
@@ -19,13 +20,15 @@ def get_api_key(request: Request):
 
 
 def verify_token(request: Request):
-    token = get_api_key(request)
-    if token != config.app.get("api_key", ""):
+    if not config.app.get("auth_enabled", False):
+        return
+
+    expected_token = config.app.get("api_key", "")
+    token = get_api_key(request) or ""
+    if not expected_token or not secrets.compare_digest(token, expected_token):
         request_id = get_task_id(request)
-        request_url = request.url
-        user_agent = request.headers.get("user-agent")
         raise HttpException(
             task_id=request_id,
             status_code=401,
-            message=f"invalid token: {request_url}, {user_agent}",
+            message="invalid api token",
         )

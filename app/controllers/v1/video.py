@@ -1,7 +1,10 @@
 import glob
 import os
+import copy
 import pathlib
+import re
 import shutil
+from uuid import UUID
 from typing import Union
 
 from fastapi import BackgroundTasks, Depends, Path, Request, UploadFile
@@ -31,8 +34,78 @@ from app.services import task as tm
 from app.utils import utils
 
 # 认证依赖项
-# router = new_router(dependencies=[Depends(base.verify_token)])
-router = new_router()
+router = new_router(dependencies=[Depends(base.verify_token)])
+
+
+def safe_join(base_dir: str, relative_path: str) -> str:
+    base_path = pathlib.Path(base_dir).resolve()
+    target_path = (base_path / relative_path).resolve()
+    if base_path != target_path and base_path not in target_path.parents:
+        raise HttpException("", status_code=400, message="invalid file path")
+    if not target_path.is_file():
+        raise HttpException("", status_code=404, message="file not found")
+    return str(target_path)
+
+
+def safe_task_dir(task_id: str) -> str:
+    try:
+        UUID(task_id)
+    except ValueError:
+        raise HttpException(task_id, status_code=400, message="invalid task id")
+
+    base_path = pathlib.Path(utils.task_dir()).resolve()
+    target_path = (base_path / task_id).resolve()
+    if base_path != target_path and base_path not in target_path.parents:
+        raise HttpException(task_id, status_code=400, message="invalid task id")
+    return str(target_path)
+
+
+def safe_upload_name(filename: str) -> str:
+    original_name = pathlib.Path(filename or "").name
+    if not original_name or pathlib.Path(original_name).suffix.lower() != ".mp3":
+        raise HttpException("", status_code=400, message="Only *.mp3 files can be uploaded")
+
+    stem = pathlib.Path(original_name).stem
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-_")[:80]
+    if not stem:
+        stem = "bgm"
+    return f"{utils.get_uuid()}-{stem}.mp3"
+
+
+def is_mp3_data(data: bytes) -> bool:
+    return data.startswith(b"ID3") or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+
+
+def save_bgm_upload(file: UploadFile, save_path: str) -> None:
+    allowed_content_types = {"audio/mpeg", "audio/mp3", "audio/x-mpeg", "application/octet-stream"}
+    if file.content_type and file.content_type not in allowed_content_types:
+        raise HttpException("", status_code=400, message="invalid audio content type")
+
+    max_size = int(config.app.get("max_bgm_upload_size_mb", 20)) * 1024 * 1024
+    total_size = 0
+    chunk_size = 1024 * 1024
+    try:
+        with open(save_path, "wb+") as buffer:
+            file.file.seek(0)
+            while True:
+                chunk = file.file.read(chunk_size)
+                if not chunk:
+                    break
+                if total_size == 0 and not is_mp3_data(chunk):
+                    raise HttpException("", status_code=400, message="invalid mp3 file")
+                if total_size + len(chunk) > max_size:
+                    raise HttpException("", status_code=413, message="BGM file is too large")
+                buffer.write(chunk)
+                total_size += len(chunk)
+    except Exception:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        raise
+
+    if total_size == 0:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        raise HttpException("", status_code=400, message="empty audio file")
 
 _enable_redis = config.app.get("enable_redis", False)
 _redis_host = config.app.get("redis_host", "localhost")
@@ -127,11 +200,12 @@ def get_task(
     request_id = base.get_task_id(request)
     task = sm.state.get_task(task_id)
     if task:
+        task = copy.deepcopy(task)
         task_dir = utils.task_dir()
 
         def file_to_uri(file):
             if not file.startswith(endpoint):
-                _uri_path = v.replace(task_dir, "tasks").replace("\\", "/")
+                _uri_path = file.replace(task_dir, "tasks").replace("\\", "/")
                 _uri_path = f"{endpoint}/{_uri_path}"
             else:
                 _uri_path = file
@@ -165,9 +239,8 @@ def delete_video(request: Request, task_id: str = Path(..., description="Task ID
     request_id = base.get_task_id(request)
     task = sm.state.get_task(task_id)
     if task:
-        tasks_dir = utils.task_dir()
-        current_task_dir = os.path.join(tasks_dir, task_id)
-        if os.path.exists(current_task_dir):
+        current_task_dir = safe_task_dir(task_id)
+        if os.path.isdir(current_task_dir):
             shutil.rmtree(current_task_dir)
 
         sm.state.delete_task(task_id)
@@ -206,27 +279,28 @@ def get_bgm_list(request: Request):
 )
 def upload_bgm_file(request: Request, file: UploadFile = File(...)):
     request_id = base.get_task_id(request)
-    # check file ext
-    if file.filename.endswith("mp3"):
-        song_dir = utils.song_dir()
-        save_path = os.path.join(song_dir, file.filename)
-        # save file
-        with open(save_path, "wb+") as buffer:
-            # If the file already exists, it will be overwritten
-            file.file.seek(0)
-            buffer.write(file.file.read())
-        response = {"file": save_path}
-        return utils.get_response(200, response)
+    try:
+        safe_name = safe_upload_name(file.filename)
+    except HttpException as e:
+        e.message = f"{request_id}: {e.message}"
+        raise
 
-    raise HttpException(
-        "", status_code=400, message=f"{request_id}: Only *.mp3 files can be uploaded"
-    )
+    song_dir = utils.song_dir()
+    save_path = os.path.join(song_dir, safe_name)
+    try:
+        save_bgm_upload(file, save_path)
+    except HttpException as e:
+        e.message = f"{request_id}: {e.message}"
+        raise
+
+    response = {"file": save_path}
+    return utils.get_response(200, response)
 
 
 @router.get("/stream/{file_path:path}")
 async def stream_video(request: Request, file_path: str):
     tasks_dir = utils.task_dir()
-    video_path = os.path.join(tasks_dir, file_path)
+    video_path = safe_join(tasks_dir, file_path)
     range_header = request.headers.get("Range")
     video_size = os.path.getsize(video_path)
     start, end = 0, video_size - 1
@@ -274,7 +348,7 @@ async def download_video(_: Request, file_path: str):
     :return: video file
     """
     tasks_dir = utils.task_dir()
-    video_path = os.path.join(tasks_dir, file_path)
+    video_path = safe_join(tasks_dir, file_path)
     file_path = pathlib.Path(video_path)
     filename = file_path.stem
     extension = file_path.suffix
