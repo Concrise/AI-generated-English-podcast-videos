@@ -26,14 +26,43 @@ def mktimestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
 
 
+def get_MiniMax_voices() -> list[str]:
+    """
+    获取 MiniMax 的英文声音列表
+    文档: https://platform.minimaxi.com/document/T2A%20V2
+    """
+    # MiniMax 英文音色（来自官方文档）
+    voices = [
+        ("speech-2.6-hd", "English_PassionateWarrior", "Female"),
+        ("speech-2.6-hd", "English_Soft_Soothing", "Female"),
+        ("speech-2.6-hd", "English_Trustworth_Man", "Male"),
+        ("speech-2.6-hd", "English_Graceful_Lady", "Female"),
+    ]
+    return [
+        f"MiniMax:{model}:{voice}-{gender}"
+        for model, voice, gender in voices
+    ]
+
+
 def get_siliconflow_voices() -> list[str]:
     """
     获取硅基流动的声音列表（从API获取）
-
-    Returns:
-        声音列表，格式为 ["siliconflow:model:voice-Gender", ...]
+    如果 MiniMax 优先，则先返回 MiniMax 声音
     """
     api_key = config.siliconflow.get("api_key", "")
+    
+    # 如果有 MiniMax key，优先返回 MiniMax 声音
+    if config.MiniMax.get("api_key", ""):
+        MiniMax_voices = get_MiniMax_voices()
+        # 仍然保留 SiliconFlow 作为备选
+        MiniMax_voices.extend(_get_siliconflow_voices_internal(api_key))
+        return MiniMax_voices
+    
+    return _get_siliconflow_voices_internal(api_key)
+
+
+def _get_siliconflow_voices_internal(api_key: str) -> list[str]:
+    """SiliconFlow 声音列表（内部使用）"""
     
     if not api_key:
         logger.warning("SiliconFlow API key is not set, using default voices")
@@ -1136,6 +1165,11 @@ def is_siliconflow_voice(voice_name: str):
     return voice_name.startswith("siliconflow:")
 
 
+def is_MiniMax_voice(voice_name: str):
+    """检查是否是 MiniMax 的声音"""
+    return voice_name.startswith("MiniMax:") or voice_name.startswith("MiniMax_")
+
+
 async def tts(
     text: str,
     voice_name: str,
@@ -1145,6 +1179,23 @@ async def tts(
 ) -> Union[SubMaker, None]:
     if is_azure_v2_voice(voice_name):
         return azure_tts_v2(text, voice_name, voice_file)
+    elif is_MiniMax_voice(voice_name):
+        # MiniMax 声音: MiniMax:model:voice_id
+        # 优先使用 MiniMax，如果 key 不可用则回退到 SiliconFlow
+        if config.MiniMax.get("api_key", ""):
+            parts = voice_name.split(":")
+            model = parts[1] if len(parts) > 1 else "speech-2.6-hd"
+            voice_id = parts[2] if len(parts) > 2 else "English_PassionateWarrior"
+            result = MiniMax_tts(text, model, voice_id, voice_rate, voice_file, voice_volume)
+            if result:
+                return result
+            logger.warning("MiniMax tts failed, trying SiliconFlow fallback")
+        # 回退到 SiliconFlow
+        if config.siliconflow.get("api_key", ""):
+            return siliconflow_tts(
+                text, "FunAudioLLM/CosyVoice2-0.5B", voice_name.replace("MiniMax:", "siliconflow:"),
+                voice_rate, voice_file, voice_volume
+            )
     elif is_siliconflow_voice(voice_name):
         # 从voice_name中提取模型和声音
         # 格式: siliconflow:model:voice-Gender
@@ -1342,6 +1393,118 @@ def siliconflow_tts(
                 )
         except Exception as e:
             logger.error(f"siliconflow tts failed: {str(e)}")
+
+    return None
+
+
+def MiniMax_tts(
+    text: str,
+    model: str,
+    voice: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """
+    使用 MiniMax API 生成语音 (替代 SiliconFlow)
+    文档: https://platform.minimaxi.com/document/T2A%20V2
+    """
+    import base64
+    text = text.strip()
+    api_key = config.MiniMax.get("api_key", "")
+
+    if not api_key:
+        logger.error("MiniMax API key is not set")
+        return None
+
+    # MiniMax TTS endpoint
+    url = "https://api.minimaxi.com/v1/t2a_v2"
+    
+    # voice 参数（如 "English_PassionateWarrior"）
+    voice_id = voice if voice else "English_PassionateWarrior"
+    
+    payload = {
+        "model": model or "speech-2.6-hd",
+        "text": text,
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": voice_rate,
+            "vol": max(1.0, min(10.0, voice_volume * 5)),  # 转换音量到 MiniMax 范围
+            "pitch": 0
+        },
+        "audio_setting": {
+            "sample_rate": 32000,
+            "bitrate": 128000,
+            "format": "mp3",
+            "channel": 1
+        }
+    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    for i in range(3):
+        try:
+            logger.info(f"MiniMax tts, model: {payload['model']}, voice: {voice_id}, try: {i + 1}")
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("base_resp", {}).get("status_code", -1) == 0:
+                    # 成功 - 提取音频
+                    audio_hex = data.get("data", {}).get("audio", "")
+                    if audio_hex:
+                        audio_bytes = bytes.fromhex(audio_hex)
+                        with open(voice_file, "wb") as f:
+                            f.write(audio_bytes)
+
+                        # 创建 SubMaker
+                        sub_maker = SubMaker()
+                        try:
+                            from moviepy import AudioFileClip
+                            audio_clip = AudioFileClip(voice_file)
+                            audio_duration = audio_clip.duration
+                            audio_clip.close()
+                            audio_duration_100ns = int(audio_duration * 10000000)
+                        except Exception:
+                            audio_duration_100ns = 10000000
+
+                        sentences = utils.split_string_by_punctuations(text)
+                        if sentences:
+                            total_chars = sum(len(s) for s in sentences)
+                            char_duration = audio_duration_100ns / total_chars if total_chars > 0 else 0
+                            current_offset = 0
+                            for sentence in sentences:
+                                if not sentence.strip():
+                                    continue
+                                sentence_duration = int(len(sentence) * char_duration)
+                                # SubMaker 用 cues 列表
+                                from datetime import timedelta
+                                from edge_tts.srt_composer import Subtitle
+                                sub_maker.cues.append(Subtitle(
+                                    index=len(sub_maker.cues) + 1,
+                                    start=timedelta(microseconds=current_offset / 10),
+                                    end=timedelta(microseconds=(current_offset + sentence_duration) / 10),
+                                    content=sentence
+                                ))
+                                current_offset += sentence_duration
+                        else:
+                            from datetime import timedelta
+                            from edge_tts.srt_composer import Subtitle
+                            sub_maker.cues.append(Subtitle(
+                                index=1,
+                                start=timedelta(microseconds=0),
+                                end=timedelta(microseconds=audio_duration_100ns / 10),
+                                content=text
+                            ))
+
+                        logger.success(f"MiniMax tts succeeded: {voice_file}")
+                        return sub_maker
+                else:
+                    logger.error(f"MiniMax tts API error: {data.get('base_resp', {})}")
+            else:
+                logger.error(f"MiniMax tts HTTP {response.status_code}: {response.text[:200]}")
+        except Exception as e:
+            logger.error(f"MiniMax tts exception: {str(e)}")
 
     return None
 

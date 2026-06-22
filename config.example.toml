@@ -1,12 +1,22 @@
 [app]
-video_source = "siliconflow"
+video_source = "MiniMax"
 hide_config = false
 
+[MiniMax]
+api_key = "sk-api-u7DlDQ8T0hfJ-x4gZp3CGiBZlUo6sH0xm779M0b2eLCP89aTdp0mu4E"
+base_url = "https://api.minimaxi.com/v1"
+llm_model = "M2-her"
+tts_model = "speech-2.6-hd"
+
 [siliconflow]
-api_key = "sk-bppchrqflzui"
+api_key = "sk-bppchrqflzyzlzpubgmqeqhaaobswqniui"
 
 [apimart]
-api_key = "sk-s4L8pbVG60aMOt5"
+api_key = "sk-s4L8pbVGNijeMo9hMM60aMOt5"
+
+[bgm]
+type = "random"
+volume = 0.15
 
 [ui]
 hide_log = false

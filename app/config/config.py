@@ -47,6 +47,7 @@ proxy = _cfg.get("proxy", {})
 azure = _cfg.get("azure", {})
 siliconflow = _cfg.get("siliconflow", {})
 apimart = _cfg.get("apimart", {})
+MiniMax = _cfg.get("MiniMax", {})
 ui = _cfg.get(
     "ui",
     {
