@@ -202,3 +202,4 @@ MIT License
 - [SiliconFlow](https://cloud.siliconflow.cn/) - LLM 和 TTS 服务
 - [apimart](https://apimart.ai/) - Gemini 图片生成服务
 - [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) - 项目参考
+- [linuxdo](https://linux.do/) - linux.do 佬友
