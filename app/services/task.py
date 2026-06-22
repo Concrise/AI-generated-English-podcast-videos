@@ -244,36 +244,39 @@ def detect_speaker_from_text(text, podcast_script, current_script_index):
         return None
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
-    if params.video_source == "local":
-        logger.info("\n\n## preprocess local materials")
-        materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+def get_video_materials(task_id, params, video_terms, audio_duration, podcast_script=None):
+    """获取视频素材 - 仅支持 SiliconFlow 图片生成"""
+    
+    # 使用 SiliconFlow 图片生成
+    if params.video_source == "siliconflow":
+        logger.info("\n\n## generating educational images from SiliconFlow")
+        generated_images = material.generate_image_materials(
+            task_id=task_id,
+            script=podcast_script or [],
+            keywords=video_terms or [],
+            audio_duration=audio_duration * params.video_count,
+            max_images=5,
         )
-        if not materials:
+        if not generated_images:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error("no valid materials found, please check the materials and try again.")
+            logger.error("failed to generate images")
             return None
-        return [material_info.url for material_info in materials]
-
-    logger.info(f"\n\n## downloading videos from {params.video_source}")
-    downloaded_videos = material.download_videos(
+        return generated_images
+    
+    # 默认使用 SiliconFlow
+    logger.info("\n\n## generating educational images from SiliconFlow")
+    generated_images = material.generate_image_materials(
         task_id=task_id,
-        search_terms=video_terms,
-        source=params.video_source,
-        video_aspect=params.video_aspect,
-        video_contact_mode=params.video_concat_mode,
+        script=podcast_script or [],
+        keywords=video_terms or [],
         audio_duration=audio_duration * params.video_count,
-        max_clip_duration=params.video_clip_duration,
+        max_images=5,
     )
-    if not downloaded_videos:
+    if not generated_images:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error(
-            "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
-        )
+        logger.error("failed to generate images")
         return None
-    return downloaded_videos
-
+    return generated_images
 
 def generate_final_videos(task_id, params, downloaded_videos, audio_file, subtitle_path):
     final_video_paths = []
@@ -392,7 +395,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
-    downloaded_videos = get_video_materials(task_id, params, video_terms, audio_duration)
+    downloaded_videos = get_video_materials(task_id, params, video_terms, audio_duration, podcast_script)
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return

@@ -47,6 +47,24 @@ class SubClippedVideoClip:
         return f"SubClippedVideoClip(file_path={self.file_path}, start_time={self.start_time}, end_time={self.end_time}, duration={self.duration}, width={self.width}, height={self.height})"
 
 
+def is_image_file(file_path: str) -> bool:
+    """检查文件是否是图片文件"""
+    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+    _, ext = os.path.splitext(file_path.lower())
+    return ext in image_extensions
+
+
+def get_image_size(file_path: str) -> tuple:
+    """获取图片尺寸"""
+    try:
+        from PIL import Image
+        with Image.open(file_path) as img:
+            return img.size
+    except Exception as e:
+        logger.error(f"Failed to get image size: {str(e)}")
+        return (512, 768)
+
+
 audio_codec = "aac"
 video_codec = "libx264"
 fps = 30
@@ -149,29 +167,35 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
+    
     for video_path in video_paths:
-        clip = VideoFileClip(video_path)
-        clip_duration = clip.duration
-        clip_w, clip_h = clip.size
-        close_clip(clip)
-        
-        start_time = 0
+        if is_image_file(video_path):
+            # 处理图片文件
+            clip_w, clip_h = get_image_size(video_path)
+            # 图片没有时长，使用最大剪辑时长作为默认时长
+            subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=0, end_time=max_clip_duration, width=clip_w, height=clip_h, duration=max_clip_duration))
+        else:
+            # 处理视频文件
+            clip = VideoFileClip(video_path)
+            clip_duration = clip.duration
+            clip_w, clip_h = clip.size
+            close_clip(clip)
+            
+            start_time = 0
 
-        while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)
-            if end_time > start_time:
-                subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=start_time, end_time=end_time, width=clip_w, height=clip_h))
-            start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
-                break
+            while start_time < clip_duration:
+                end_time = min(start_time + max_clip_duration, clip_duration)
+                if end_time > start_time:
+                    subclipped_items.append(SubClippedVideoClip(file_path=video_path, start_time=start_time, end_time=end_time, width=clip_w, height=clip_h))
+                start_time = end_time
+                if video_concat_mode.value == VideoConcatMode.sequential.value:
+                    break
 
-    # random subclipped_items order
     if video_concat_mode.value == VideoConcatMode.random.value:
         random.shuffle(subclipped_items)
         
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
     
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
     for i, subclipped_item in enumerate(subclipped_items):
         if video_duration > audio_duration:
             break
@@ -179,10 +203,18 @@ def combine_videos(
         logger.debug(f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, current duration: {video_duration:.2f}s, remaining: {audio_duration - video_duration:.2f}s")
         
         try:
-            clip = VideoFileClip(subclipped_item.file_path).subclipped(subclipped_item.start_time, subclipped_item.end_time)
-            clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
-            clip_w, clip_h = clip.size
+            if is_image_file(subclipped_item.file_path):
+                # 处理图片
+                clip = ImageClip(subclipped_item.file_path).with_duration(max_clip_duration)
+                clip_duration = max_clip_duration
+                clip_w, clip_h = clip.size
+            else:
+                # 处理视频
+                clip = VideoFileClip(subclipped_item.file_path).subclipped(subclipped_item.start_time, subclipped_item.end_time)
+                clip_duration = clip.duration
+                clip_w, clip_h = clip.size
+            
+            # 调整尺寸
             if clip_w != video_width or clip_h != video_height:
                 clip_ratio = clip.w / clip.h
                 video_ratio = video_width / video_height
@@ -227,7 +259,6 @@ def combine_videos(
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
                 
-            # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
             clip_duration = clip.duration
             clip.write_videofile(clip_file, logger=None, fps=fps, codec=video_codec)

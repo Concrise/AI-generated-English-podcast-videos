@@ -268,249 +268,48 @@ if not config.app.get("hide_config", False):
             )
             config.ui["hide_log"] = hide_log
 
-        # 中间面板 - LLM 设置
+        # 中间面板 - LLM 设置 (仅使用 SiliconFlow)
 
         with middle_config_panel:
             st.write(tr("LLM Settings"))
-            llm_providers = [
-                "OpenAI",
-                "Moonshot",
-                "Azure",
-                "Qwen",
-                "DeepSeek",
-                "Gemini",
-                "Ollama",
-                "G4f",
-                "OneAPI",
-                "Cloudflare",
-                "ERNIE",
-                "Pollinations",
-            ]
-            saved_llm_provider = config.app.get("llm_provider", "OpenAI").lower()
-            saved_llm_provider_index = 0
-            for i, provider in enumerate(llm_providers):
-                if provider.lower() == saved_llm_provider:
-                    saved_llm_provider_index = i
-                    break
-
-            llm_provider = st.selectbox(
-                tr("LLM Provider"),
-                options=llm_providers,
-                index=saved_llm_provider_index,
+            
+            # 固定使用 SiliconFlow
+            st.info("使用 SiliconFlow 作为 LLM 提供商")
+            llm_provider = "siliconflow"
+            
+            siliconflow_api_key = config.siliconflow.get("api_key", "")
+            st_siliconflow_api_key = st.text_input(
+                "SiliconFlow API Key", 
+                value=siliconflow_api_key, 
+                type="password"
             )
-            llm_helper = st.container()
-            llm_provider = llm_provider.lower()
-            config.app["llm_provider"] = llm_provider
+            
+            if st_siliconflow_api_key:
+                config.siliconflow["api_key"] = st_siliconflow_api_key
+            
+            tips = """
+                    ##### SiliconFlow 配置说明
+                    - **API Key**: [点击到官网申请](https://cloud.siliconflow.cn/)
+                    - 支持模型: Qwen/Qwen3-8B, zai-org/GLM-4.6, deepseek-ai/DeepSeek-V3.2
+                    - 国内可直接访问，不需要VPN
+                    - 注册就送额度
+                    """
+            st.info(tips)
 
-            llm_api_key = config.app.get(f"{llm_provider}_api_key", "")
-            llm_secret_key = config.app.get(
-                f"{llm_provider}_secret_key", ""
-            )  # only for baidu ernie
-            llm_base_url = config.app.get(f"{llm_provider}_base_url", "")
-            llm_model_name = config.app.get(f"{llm_provider}_model_name", "")
-            llm_account_id = config.app.get(f"{llm_provider}_account_id", "")
-
-            tips = ""
-            if llm_provider == "ollama":
-                if not llm_model_name:
-                    llm_model_name = "qwen:7b"
-                if not llm_base_url:
-                    llm_base_url = "http://localhost:11434/v1"
-
-                with llm_helper:
-                    tips = """
-                            ##### Ollama配置说明
-                            - **API Key**: 随便填写，比如 123
-                            - **Base Url**: 一般为 http://localhost:11434/v1
-                                - 如果 `MoneyPrinterTurbo` 和 `Ollama` **不在同一台机器上**，需要填写 `Ollama` 机器的IP地址
-                                - 如果 `MoneyPrinterTurbo` 是 `Docker` 部署，建议填写 `http://host.docker.internal:11434/v1`
-                            - **Model Name**: 使用 `ollama list` 查看，比如 `qwen:7b`
-                            """
-
-            if llm_provider == "openai":
-                if not llm_model_name:
-                    llm_model_name = "gpt-3.5-turbo"
-                with llm_helper:
-                    tips = """
-                            ##### OpenAI 配置说明
-                            > 需要VPN开启全局流量模式
-                            - **API Key**: [点击到官网申请](https://platform.openai.com/api-keys)
-                            - **Base Url**: 可以留空
-                            - **Model Name**: 填写**有权限**的模型，[点击查看模型列表](https://platform.openai.com/settings/organization/limits)
-                            """
-
-            if llm_provider == "moonshot":
-                if not llm_model_name:
-                    llm_model_name = "moonshot-v1-8k"
-                with llm_helper:
-                    tips = """
-                            ##### Moonshot 配置说明
-                            - **API Key**: [点击到官网申请](https://platform.moonshot.cn/console/api-keys)
-                            - **Base Url**: 固定为 https://api.moonshot.cn/v1
-                            - **Model Name**: 比如 moonshot-v1-8k，[点击查看模型列表](https://platform.moonshot.cn/docs/intro#%E6%A8%A1%E5%9E%8B%E5%88%97%E8%A1%A8)
-                            """
-            if llm_provider == "oneapi":
-                if not llm_model_name:
-                    llm_model_name = (
-                        "claude-3-5-sonnet-20240620"  # 默认模型，可以根据需要调整
-                    )
-                with llm_helper:
-                    tips = """
-                        ##### OneAPI 配置说明
-                        - **API Key**: 填写您的 OneAPI 密钥
-                        - **Base Url**: 填写 OneAPI 的基础 URL
-                        - **Model Name**: 填写您要使用的模型名称，例如 claude-3-5-sonnet-20240620
-                        """
-
-            if llm_provider == "qwen":
-                if not llm_model_name:
-                    llm_model_name = "qwen-max"
-                with llm_helper:
-                    tips = """
-                            ##### 通义千问Qwen 配置说明
-                            - **API Key**: [点击到官网申请](https://dashscope.console.aliyun.com/apiKey)
-                            - **Base Url**: 留空
-                            - **Model Name**: 比如 qwen-max，[点击查看模型列表](https://help.aliyun.com/zh/dashscope/developer-reference/model-introduction#3ef6d0bcf91wy)
-                            """
-
-            if llm_provider == "g4f":
-                if not llm_model_name:
-                    llm_model_name = "gpt-3.5-turbo"
-                with llm_helper:
-                    tips = """
-                            ##### gpt4free 配置说明
-                            > [GitHub开源项目](https://github.com/xtekky/gpt4free)，可以免费使用GPT模型，但是**稳定性较差**
-                            - **API Key**: 随便填写，比如 123
-                            - **Base Url**: 留空
-                            - **Model Name**: 比如 gpt-3.5-turbo，[点击查看模型列表](https://github.com/xtekky/gpt4free/blob/main/g4f/models.py#L308)
-                            """
-            if llm_provider == "azure":
-                with llm_helper:
-                    tips = """
-                            ##### Azure 配置说明
-                            > [点击查看如何部署模型](https://learn.microsoft.com/zh-cn/azure/ai-services/openai/how-to/create-resource)
-                            - **API Key**: [点击到Azure后台创建](https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub/~/OpenAI)
-                            - **Base Url**: 留空
-                            - **Model Name**: 填写你实际的部署名
-                            """
-
-            if llm_provider == "gemini":
-                if not llm_model_name:
-                    llm_model_name = "gemini-1.0-pro"
-
-                with llm_helper:
-                    tips = """
-                            ##### Gemini 配置说明
-                            > 需要VPN开启全局流量模式
-                            - **API Key**: [点击到官网申请](https://ai.google.dev/)
-                            - **Base Url**: 留空
-                            - **Model Name**: 比如 gemini-1.0-pro
-                            """
-
-            if llm_provider == "deepseek":
-                if not llm_model_name:
-                    llm_model_name = "deepseek-chat"
-                if not llm_base_url:
-                    llm_base_url = "https://api.deepseek.com"
-                with llm_helper:
-                    tips = """
-                            ##### DeepSeek 配置说明
-                            - **API Key**: [点击到官网申请](https://platform.deepseek.com/api_keys)
-                            - **Base Url**: 固定为 https://api.deepseek.com
-                            - **Model Name**: 固定为 deepseek-chat
-                            """
-
-            if llm_provider == "ernie":
-                with llm_helper:
-                    tips = """
-                            ##### 百度文心一言 配置说明
-                            - **API Key**: [点击到官网申请](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application)
-                            - **Secret Key**: [点击到官网申请](https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application)
-                            - **Base Url**: 填写 **请求地址** [点击查看文档](https://cloud.baidu.com/doc/WENXINWORKSHOP/s/jlil56u11#%E8%AF%B7%E6%B1%82%E8%AF%B4%E6%98%8E)
-                            """
-
-            if llm_provider == "pollinations":
-                if not llm_model_name:
-                    llm_model_name = "default"
-                with llm_helper:
-                    tips = """
-                            ##### Pollinations AI Configuration
-                            - **API Key**: Optional - Leave empty for public access
-                            - **Base Url**: Default is https://text.pollinations.ai/openai
-                            - **Model Name**: Use 'openai-fast' or specify a model name
-                            """
-
-            if tips and config.ui["language"] == "zh":
-                st.warning(
-                    "中国用户建议使用 **DeepSeek** 或 **Moonshot** 作为大模型提供商\n- 国内可直接访问，不需要VPN \n- 注册就送额度，基本够用"
-                )
-                st.info(tips)
-
-            st_llm_api_key = st.text_input(
-                tr("API Key"), value=llm_api_key, type="password"
-            )
-            st_llm_base_url = st.text_input(tr("Base Url"), value=llm_base_url)
-            st_llm_model_name = ""
-            if llm_provider != "ernie":
-                st_llm_model_name = st.text_input(
-                    tr("Model Name"),
-                    value=llm_model_name,
-                    key=f"{llm_provider}_model_name_input",
-                )
-                if st_llm_model_name:
-                    config.app[f"{llm_provider}_model_name"] = st_llm_model_name
-            else:
-                st_llm_model_name = None
-
-            if st_llm_api_key:
-                config.app[f"{llm_provider}_api_key"] = st_llm_api_key
-            if st_llm_base_url:
-                config.app[f"{llm_provider}_base_url"] = st_llm_base_url
-            if st_llm_model_name:
-                config.app[f"{llm_provider}_model_name"] = st_llm_model_name
-            if llm_provider == "ernie":
-                st_llm_secret_key = st.text_input(
-                    tr("Secret Key"), value=llm_secret_key, type="password"
-                )
-                config.app[f"{llm_provider}_secret_key"] = st_llm_secret_key
-
-            if llm_provider == "cloudflare":
-                st_llm_account_id = st.text_input(
-                    tr("Account ID"), value=llm_account_id
-                )
-                if st_llm_account_id:
-                    config.app[f"{llm_provider}_account_id"] = st_llm_account_id
-
-        # 右侧面板 - API 密钥设置
+        # 右侧面板 - SiliconFlow 设置
         with right_config_panel:
-
-            def get_keys_from_config(cfg_key):
-                api_keys = config.app.get(cfg_key, [])
-                if isinstance(api_keys, str):
-                    api_keys = [api_keys]
-                api_key = ", ".join(api_keys)
-                return api_key
-
-            def save_keys_to_config(cfg_key, value):
-                value = value.replace(" ", "")
-                if value:
-                    config.app[cfg_key] = value.split(",")
-
-            st.write(tr("Video Source Settings"))
-
-            pexels_api_key = get_keys_from_config("pexels_api_keys")
-            pexels_api_key = st.text_input(
-                tr("Pexels API Key"), value=pexels_api_key, type="password"
+            st.write(tr("SiliconFlow Settings"))
+            
+            # SiliconFlow 图片生成 API Key
+            siliconflow_image_key = config.siliconflow.get("api_key", "")
+            siliconflow_image_key = st.text_input(
+                "SiliconFlow API Key", 
+                value=siliconflow_image_key, 
+                type="password"
             )
-            save_keys_to_config("pexels_api_keys", pexels_api_key)
+            if siliconflow_image_key:
+                config.siliconflow["api_key"] = siliconflow_image_key
 
-            pixabay_api_key = get_keys_from_config("pixabay_api_keys")
-            pixabay_api_key = st.text_input(
-                tr("Pixabay API Key"), value=pixabay_api_key, type="password"
-            )
-            save_keys_to_config("pixabay_api_keys", pixabay_api_key)
-
-llm_provider = config.app.get("llm_provider", "").lower()
 panel = st.columns(3)
 left_panel = panel[0]
 middle_panel = panel[1]
@@ -646,15 +445,10 @@ with middle_panel:
             (tr("Random"), "random"),
         ]
         video_sources = [
-            (tr("Pexels"), "pexels"),
-            (tr("Pixabay"), "pixabay"),
-            (tr("Local file"), "local"),
-            (tr("TikTok"), "douyin"),
-            (tr("Bilibili"), "bilibili"),
-            (tr("Xiaohongshu"), "xiaohongshu"),
+            (tr("SiliconFlow AI"), "siliconflow"),
         ]
 
-        saved_video_source_name = config.app.get("video_source", "local")
+        saved_video_source_name = config.app.get("video_source", "siliconflow")
         saved_video_source_index = [v[1] for v in video_sources].index(
             saved_video_source_name
         )
@@ -734,51 +528,13 @@ with middle_panel:
     with st.container(border=True):
         st.write(tr("Audio Settings"))
 
-        # 添加TTS服务器选择下拉框
-        tts_servers = [
-            ("azure-tts-v1", "Azure TTS V1"),
-            ("azure-tts-v2", "Azure TTS V2"),
-            ("siliconflow", "SiliconFlow TTS"),
-        ]
-
-        # 获取保存的TTS服务器，默认为v1
-        saved_tts_server = config.ui.get("tts_server", "azure-tts-v1")
-        saved_tts_server_index = 0
-        for i, (server_value, _) in enumerate(tts_servers):
-            if server_value == saved_tts_server:
-                saved_tts_server_index = i
-                break
-
-        selected_tts_server_index = st.selectbox(
-            tr("TTS Servers"),
-            options=range(len(tts_servers)),
-            format_func=lambda x: tts_servers[x][1],
-            index=saved_tts_server_index,
-        )
-
-        selected_tts_server = tts_servers[selected_tts_server_index][0]
+        # TTS 服务器（固定使用 SiliconFlow）
+        st.info("使用 SiliconFlow 作为 TTS 服务")
+        selected_tts_server = "siliconflow"
         config.ui["tts_server"] = selected_tts_server
 
-        # 根据选择的TTS服务器获取声音列表
-        filtered_voices = []
-
-        if selected_tts_server == "siliconflow":
-            # 获取硅基流动的声音列表
-            filtered_voices = voice.get_siliconflow_voices()
-        else:
-            # 获取Azure的声音列表
-            all_voices = voice.get_all_azure_voices(filter_locals=None)
-
-            # 根据选择的TTS服务器筛选声音
-            for v in all_voices:
-                if selected_tts_server == "azure-tts-v2":
-                    # V2版本的声音名称中包含"v2"
-                    if "V2" in v:
-                        filtered_voices.append(v)
-                else:
-                    # V1版本的声音名称中不包含"v2"
-                    if "V2" not in v:
-                        filtered_voices.append(v)
+        # 获取 SiliconFlow 的声音列表
+        filtered_voices = voice.get_siliconflow_voices()
 
         voice_name = st.session_state["speaker_1_voice"]
         if not filtered_voices:
@@ -822,51 +578,27 @@ with middle_panel:
                     else:
                         st.error(tr("语音试听生成失败"))
 
-        # 当选择V2版本或者声音是V2声音时，显示服务区域和API key输入框
-        if selected_tts_server == "azure-tts-v2" or (
-            voice_name and voice.is_azure_v2_voice(voice_name)
-        ):
-            saved_azure_speech_region = config.azure.get("speech_region", "")
-            saved_azure_speech_key = config.azure.get("speech_key", "")
-            azure_speech_region = st.text_input(
-                tr("Speech Region"),
-                value=saved_azure_speech_region,
-                key="azure_speech_region_input",
-            )
-            azure_speech_key = st.text_input(
-                tr("Speech Key"),
-                value=saved_azure_speech_key,
-                type="password",
-                key="azure_speech_key_input",
-            )
-            config.azure["speech_region"] = azure_speech_region
-            config.azure["speech_key"] = azure_speech_key
+        # SiliconFlow API Key 配置
+        saved_siliconflow_api_key = config.siliconflow.get("api_key", "")
+        siliconflow_api_key = st.text_input(
+            tr("SiliconFlow API Key"),
+            value=saved_siliconflow_api_key,
+            type="password",
+            key="siliconflow_api_key_input",
+        )
 
-        # 当选择硅基流动时，显示API key输入框和说明信息
-        if selected_tts_server == "siliconflow" or (
-            voice_name and voice.is_siliconflow_voice(voice_name)
-        ):
-            saved_siliconflow_api_key = config.siliconflow.get("api_key", "")
+        # 显示 SiliconFlow 的说明信息
+        st.info(
+            tr("SiliconFlow TTS Settings")
+            + ":\n"
+            + "- "
+            + tr("Speed: Range [0.25, 4.0], default is 1.0")
+            + "\n"
+            + "- "
+            + tr("Volume: Uses Speech Volume setting, default 1.0 maps to gain 0")
+        )
 
-            siliconflow_api_key = st.text_input(
-                tr("SiliconFlow API Key"),
-                value=saved_siliconflow_api_key,
-                type="password",
-                key="siliconflow_api_key_input",
-            )
-
-            # 显示硅基流动的说明信息
-            st.info(
-                tr("SiliconFlow TTS Settings")
-                + ":\n"
-                + "- "
-                + tr("Speed: Range [0.25, 4.0], default is 1.0")
-                + "\n"
-                + "- "
-                + tr("Volume: Uses Speech Volume setting, default 1.0 maps to gain 0")
-            )
-
-            config.siliconflow["api_key"] = siliconflow_api_key
+        config.siliconflow["api_key"] = siliconflow_api_key
 
         params.voice_volume = st.selectbox(
             tr("Speech Volume"),
@@ -995,18 +727,8 @@ if start_button:
     params.speaker_2_voice = st.session_state["speaker_2_voice"]
     params.video_terms = llm.generate_terms_from_podcast(params.podcast_script)
 
-    if params.video_source not in ["pexels", "pixabay", "local"]:
+    if params.video_source not in ["siliconflow"]:
         st.error(tr("Please Select a Valid Video Source"))
-        scroll_to_bottom()
-        st.stop()
-
-    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
-        st.error(tr("Please Enter the Pexels API Key"))
-        scroll_to_bottom()
-        st.stop()
-
-    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
-        st.error(tr("Please Enter the Pixabay API Key"))
         scroll_to_bottom()
         st.stop()
 
