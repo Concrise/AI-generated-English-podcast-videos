@@ -1,9 +1,20 @@
-"""Test LLM and TTS end-to-end with MiniMax"""
+"""Test LLM and TTS end-to-end with MiniMax.
+
+This is a manual integration script (makes real API calls and costs money).
+Skip by default: run with `python -m pytest -m integration test_e2e.py`.
+"""
+import os
 import sys
+import pytest
+
+pytestmark = pytest.mark.integration
+if os.getenv("RUN_INTEGRATION_TESTS") != "1":
+    pytest.skip("integration test skipped by default", allow_module_level=True)
+
 sys.path.insert(0, '.')
 
 from app.services import llm
-from app.services.voice import MiniMax_tts
+from app.services.voice import MiniMax_tts, get_audio_duration
 
 print("=" * 60)
 print("Test 1: LLM with MiniMax")
@@ -26,9 +37,13 @@ sub_maker = MiniMax_tts(
     voice_volume=1.0
 )
 if sub_maker:
-    print(f"TTS succeeded, subs: {sub_maker.subs[:2]}")
-    import os
+    try:
+        dur = get_audio_duration(sub_maker)
+        print(f"TTS succeeded, duration: {dur:.2f}s")
+    except Exception as e:
+        print(f"TTS succeeded (duration unavailable: {e})")
     if os.path.exists("test_end2end.mp3"):
         print(f"File size: {os.path.getsize('test_end2end.mp3')} bytes")
 else:
     print("TTS failed")
+

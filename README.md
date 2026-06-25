@@ -1,205 +1,275 @@
-# AI-generated-English-podcast-videos 📚
+# AI 生成英语播客视频
 
-<div align="center">
+通过 AI 播客工作流，将文章文本生成简短的教学视频。
 
-**一键将英文文章转换为教育短视频** - 自动生成双人对话、语音讲解、教育图片，合成高清视频
+## 架构
 
-</div>
+所有 AI 能力仅使用两个服务商：
 
----
+| 能力 | 服务商 | 模型 / 接口 |
+|------|--------|-------------|
+| **LLM**（脚本与关键词） | MiniMax | `MiniMax-M2.5`（`/v1/text/chatcompletion_v2`） |
+| **TTS**（语音合成） | MiniMax | `speech-2.6-hd`（`/v1/t2a_v2`） |
+| **生图**（素材） | apimart | `gemini-3.1-flash-image-preview`（`/v1/images/generations`） |
 
-## ✨ 功能特性
+```text
+文章 → MiniMax LLM（播客脚本）→ MiniMax LLM（关键词）
+     → apimart（逐句生成一张图片）
+     → MiniMax TTS（逐句生成一段语音）
+     → ffmpeg（图片+语音 → 片段 → 拼接）
+     → ffmpeg（混合背景音乐）
+     → 最终视频
+```
 
-- 🎯 **全自动流程**: 文章 → 对话脚本 → 教育图片 → 语音音频 → 视频合成
-- 🎨 **教育图片**: 使用 Gemini-3 生成中小学英语课本风格的图片（句子置顶、关键词音标、彩色插图）
-- 🔊 **语音合成**: SiliconFlow TTS 生成的英文语音，支持 anna（女声）和 benjamin（男声）
-- 🎬 **智能同步**: 每个对话片段的音频与对应图片精确匹配
-- 📐 **多种尺寸**: 支持竖屏（9:16）和横屏（16:9）视频输出
-- 🌐 **Web界面**: 简洁易用的网页界面，一键生成视频
-- ⚙️ **配置简单**: 所有配置集中在 config.toml，无需在界面配置
+**不再使用 SiliconFlow。** LLM 与 TTS 均统一使用 MiniMax，生图使用 apimart。无需 Pexels / Pixabay 的 key。
 
-## 🛠️ 技术架构
+## 功能特性
 
-| 模块 | 技术 |
-|------|------|
-| 对话生成 | SiliconFlow API (LLM) |
-| 图片生成 | apimart Gemini-3 |
-| 语音合成 | SiliconFlow TTS (CosyVoice2-0.5B) |
-| 视频合成 | ffmpeg + MoviePy |
-| Web界面 | Streamlit |
+- 根据文章生成播客脚本（MiniMax LLM）
+- 双说话人音色选择与试听（MiniMax TTS）
+- 播客语音合成
+- 逐句 AI 生图（apimart）
+- 本地素材支持（传统方式，可选）
+- 背景音乐：随机 / 指定曲目 / 无，带音量调节
+- WebUI 与 HTTP API
+- 竖屏视频输出
+- **无字幕** —— 视频只包含图片 + 语音 + 音乐
 
-## 🚀 快速开始
+## 环境要求
 
-### 1. 克隆代码
+- Python 3.11
+- FFmpeg + ffprobe（需在 PATH 中，WebUI 直接按名字调用 `ffmpeg` / `ffprobe`）
+- **纯 CPU 运行** —— 无需 CUDA / GPU / torch，无需 ImageMagick，无需下载 Whisper 模型
 
-```bash
+## 快速开始
+
+### 1. 克隆项目
+
+```shell
 git clone https://github.com/liangdabiao/AI-generated-English-podcast-videos.git
 cd AI-generated-English-podcast-videos
 ```
 
 ### 2. 安装依赖
 
-```bash
+```shell
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 3. 配置 API Key
+### 3. 配置密钥
 
-复制配置文件并填写您的 API Key：
+复制示例配置并编辑：
 
-```bash
-copy config.example.toml config.toml
+```shell
+copy config.example.toml config.toml  # Windows
+# cp config.example.toml config.toml  # macOS/Linux
 ```
 
-编辑 `config.toml`：
+编辑 `config.toml` —— 只需要两个 key：
 
 ```toml
-[siliconflow]
-api_key = "your-siliconflow-api-key"  # LLM + TTS
+[MiniMax]
+api_key = "你的-minimax-key"     # 必填：LLM（MiniMax-M2.5）+ TTS（speech-2.6-hd）
+llm_model = "MiniMax-M2.5"
+tts_model = "speech-2.6-hd"
 
 [apimart]
-api_key = "your-apimart-api-key"  # 图片生成
+api_key = "你的-apimart-key"     # 必填：生图（gemini-3.1-flash-image-preview）
 ```
 
-**API Key 申请地址：**
-- SiliconFlow: https://cloud.siliconflow.cn/
-- apimart: https://apimart.ai/keys
+`[siliconflow]` 段已弃用，不再使用。无需 Pexels / Pixabay 的 key。
 
-### 4. 运行 Web 界面
+可选的 API 鉴权（用于对外暴露 HTTP API 时）：
 
-```bash
-cd webui
-streamlit run Main.py --server.port 8501
+- 设置 `auth_enabled = true`
+- 设置 `api_key` 为一串足够长的随机字符串
+- 调用时通过 HTTP 头 `x-api-key` 传入
+
+> 安全提醒：如果某个 key 曾经被提交或分享过，请务必到服务商控制台**轮换 / 撤销**它——仅从后续提交中删除，并不能把它从 git 历史中移除。
+
+### 4. 验证环境
+
+```shell
+ffmpeg -version
+ffprobe -version
 ```
 
-打开浏览器访问 http://localhost:8501
+两者都必须能在 PATH 中找到。如果没有，请把 FFmpeg 的 `bin` 目录加到 PATH（WebUI 是直接按名字调用 `ffmpeg` / `ffprobe` 的）。
 
-### 5. 生成视频
+### 5. 启动 WebUI
 
-1. 输入英文文章（或点击"使用示例文章"）
-2. 点击"开始生成视频"
-3. 等待生成完成，预览并下载视频
-
-## 📁 项目结构
-
-```
-AI-generated-English-podcast-videos/
-├── app/
-│   ├── config.py          # 配置管理
-│   ├── models/            # 数据模型
-│   │   └── schema.py
-│   └── services/
-│       ├── llm.py         # LLM 对话生成
-│       ├── voice.py       # 语音合成
-│       ├── image_generator.py  # 图片生成
-│       ├── video.py       # 视频合成
-│       └── podcast_audio.py    # 播客音频
-├── webui/
-│   └── Main.py            # Web 界面
-├── config.toml            # 配置文件
-├── config.example.toml     # 配置示例
-└── requirements.txt       # 依赖列表
+```shell
+streamlit run webui/Main.py --server.address=0.0.0.0 --server.port=8501
 ```
 
-## 🔧 配置说明
+打开：
 
-### 配置文件结构
-
-```toml
-[siliconflow]
-api_key = "your-siliconflow-api-key"  # LLM + TTS
-
-[apimart]
-api_key = "your-apimart-api-key"  # 图片生成
-
-[app.podcast]
-default_speaker_1_voice = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:anna-Female"
-default_speaker_2_voice = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:benjamin-Male"
+```text
+http://127.0.0.1:8501
 ```
 
-### 视频尺寸
+### 6. 启动 API
 
-- 竖屏: 9:16 (1080x1920)
-- 横屏: 16:9 (1920x1080)
-
-## 🎬 工作流程
-
-```
-┌─────────────┐
-│  输入文章    │
-└──────┬──────┘
-       ▼
-┌─────────────────┐
-│  生成双人对话脚本  │
-│  (Speaker 1/2)  │
-└──────┬──────────┘
-       ▼
-┌─────────────────┐     ┌─────────────────┐
-│  生成教育图片    │     │  生成语音音频    │
-│  (apimart)      │     │  (SiliconFlow)  │
-└──────┬──────────┘     └──────┬──────────┘
-       ▼                       ▼
-┌─────────────────────────────────────┐
-│  视频合成：图片与音频精确匹配         │
-│  每个对话片段时长 = 对应图片显示时长   │
-└────────────────┬────────────────────┘
-                 ▼
-          ┌───────────┐
-          │  最终视频  │
-          └───────────┘
+```shell
+python main.py
 ```
 
-## 📝 示例输出
+API 文档：
 
-### 输入文章
-
-```
-The Dragon Boat Festival is a traditional Chinese holiday...
+```text
+http://127.0.0.1:8080/docs
 ```
 
-### 生成对话
+## WebUI 使用流程
 
+1. 粘贴文章文本。
+2. 选择对话人 1（女声）和对话人 2（男声）—— 默认为 MiniMax 英文音色。
+3. 选择背景音乐：随机 / 指定曲目 / 无，并调节音乐音量，可试听选定曲目。
+4. 点击生成。每句话会生成一张 AI 图片 + 一段 TTS 语音；片段拼接后混入背景音乐。
+
+## 音色列表
+
+MiniMax 英文音色（T2A V2，已验证可用）：
+- `English_PassionateWarrior`（女声）
+- `English_Graceful_Lady`（女声）
+- `English_Cute_Girl`（女声）
+- `English_Trustworth_Man`（男声）
+
+## 背景音乐
+
+音乐文件位于 `resource/songs/`（内置 29 个 mp3）。可选择随机，或在"指定曲目"模式下挑选某一首。
+
+## 字幕
+
+本版本**不渲染字幕轨**。视频只包含图片 + 语音 + 音乐。
+
+## Docker
+
+先创建 `config.toml`，然后运行：
+
+```shell
+docker compose up
 ```
-Speaker 1: Welcome to our English learning podcast! Today we're talking about the Dragon Boat Festival.
 
-Speaker 2: That sounds exciting! When is the Dragon Boat Festival celebrated?
+WebUI：
 
-Speaker 1: It's on the fifth day of the fifth lunar month. People gather along rivers to watch dragon boat races.
+```text
+http://127.0.0.1:8501
+```
+
+API 文档：
+
+```text
+http://127.0.0.1:8080/docs
+```
+
+## API 流程
+
+### 生成播客脚本
+
+`POST /api/v1/scripts`
+
+```json
+{
+  "article_text": "在此粘贴文章...",
+  "language": "English",
+  "speaker_1_voice": "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female",
+  "speaker_2_voice": "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male"
+}
+```
+
+### 生成素材关键词
+
+`POST /api/v1/terms`
+
+```json
+{
+  "podcast_script": [
+    {
+      "speaker_1": "Welcome to today's episode...",
+      "speaker_2": "Let's explore the topic...",
+      "speaker_1_voice": "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female",
+      "speaker_2_voice": "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male"
+    }
+  ],
+  "amount": 4
+}
 ```
 
 ### 生成视频
 
-- 每段对话对应一张教育图片
-- 图片显示时长 = 对话音频时长
-- 自动拼接成最终视频
+`POST /api/v1/videos`
 
-## 🔍 常见问题
+```json
+{
+  "article_text": "在此粘贴文章...",
+  "podcast_script": [
+    {
+      "speaker_1": "Welcome to today's episode...",
+      "speaker_2": "Let's explore the topic...",
+      "speaker_1_voice": "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female",
+      "speaker_2_voice": "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male"
+    }
+  ],
+  "video_terms": "podcast studio, technology, city life",
+  "video_source": "MiniMax",
+  "video_aspect": "9:16",
+  "video_count": 1
+}
+```
 
-### Q: 图片生成失败？
+若开启了 `auth_enabled = true`，请求需带：
 
-1. 检查 apimart API Key 是否正确配置
-2. 检查 apimart 账户余额是否充足
-3. 查看日志中的详细错误信息
+```text
+x-api-key: 你的-api-key
+```
 
-### Q: 视频合成失败？
+## 测试
 
-1. 确保 ffmpeg 已安装并添加到 PATH
-2. 检查生成的图片和音频文件是否完整
-3. 查看日志中的详细错误信息
+本地语法检查：
 
-### Q: 语音合成失败？
+```shell
+python -m compileall app webui
+```
 
-1. 检查 SiliconFlow API Key 是否正确配置
-2. 检查账户余额是否充足
-3. 确认网络连接正常
+单元测试（不含联网集成测试）：
 
-## 📄 许可证
+```shell
+python -m pytest -q
+```
 
-MIT License
+调用真实外部服务或启动本地服务器的集成测试，默认标记为 `integration` 并跳过。只有在配置好 key 且授权真实外部调用后，才运行：
+
+```shell
+python -m pytest -q -m integration
+```
+
+配置好 key 后建议的真实验证步骤：
+
+1. WebUI：粘贴文章 → 生成播客对话 → 试听两个音色 → 生成视频。
+2. API：依次调用 `/api/v1/scripts`、`/api/v1/terms`、`/api/v1/videos`。
+3. 安全检查：
+   - `/api/v1/stream/../../config.toml` 应失败。
+   - `/api/v1/download/../../config.toml` 应失败。
+   - BGM 上传可疑文件名时，应被保存为安全生成的文件名。
+   - 若 `auth_enabled = true`，不带 `x-api-key` 的请求应返回 401。
+
+## 备注
+
+- 本项目已是纯播客模式。`video_subject`、传统 `video_script`、`podcast_mode`、`voice_name`、`paragraph_number` 等遗留字段已不在请求 schema 中。
+- `video_terms` 仍作为素材搜索关键词字段保留，以兼容现有内部逻辑。
+- 除在可信本地代理下调试外，请保持 `verify_ssl = true`。
+
+## 许可证
+
+详见 [`LICENSE`](LICENSE)。
 
 ## 🙏 致谢
 
-- [SiliconFlow](https://cloud.siliconflow.cn/) - LLM 和 TTS 服务
+- [MiniMax](https://platform.minimaxi.com/) - LLM 与 TTS 服务
 - [apimart](https://apimart.ai/) - Gemini 图片生成服务
 - [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) - 项目参考
 - [linuxdo](https://linux.do/) - linux.do 佬友

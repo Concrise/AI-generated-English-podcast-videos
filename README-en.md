@@ -8,7 +8,7 @@ All AI capabilities use two providers:
 
 | Capability | Provider | Model / Endpoint |
 |------------|----------|------------------|
-| **LLM** (script & keywords) | MiniMax | `M2-her` (`/v1/text/chatcompletion_v2`) |
+| **LLM** (script & keywords) | MiniMax | `MiniMax-M2.5` (`/v1/text/chatcompletion_v2`) |
 | **TTS** (voice synthesis) | MiniMax | `speech-2.6-hd` (`/v1/t2a_v2`) |
 | **Image** (material) | apimart | gemini-3 (`/v1/images/generations`) |
 
@@ -72,8 +72,8 @@ Edit `config.toml` — only two keys are required:
 
 ```toml
 [MiniMax]
-api_key = "your-minimax-key"     # REQUIRED: LLM (M2-her) + TTS (speech-2.6-hd)
-llm_model = "M2-her"
+api_key = "your-minimax-key"     # REQUIRED: LLM (MiniMax-M2.5) + TTS (speech-2.6-hd)
+llm_model = "MiniMax-M2.5"
 tts_model = "speech-2.6-hd"
 
 [apimart]
@@ -243,3 +243,11 @@ Recommended real verification after configuring keys:
 ## License
 
 See [`LICENSE`](LICENSE).
+
+
+## 🙏 致谢
+
+- [SiliconFlow](https://cloud.siliconflow.cn/) - LLM 和 TTS 服务
+- [apimart](https://apimart.ai/) - Gemini 图片生成服务
+- [MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) - 项目参考
+- [linuxdo](https://linux.do/) - linux.do 佬友
