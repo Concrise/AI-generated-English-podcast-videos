@@ -1,30 +1,45 @@
 # AI-generated English Podcast Videos
 
-This project generates short videos from long-form article text using a podcast-only workflow.
+Generate short educational videos from article text using an AI podcast workflow.
 
-The traditional single-speaker/topic-based video mode has been removed. The current pipeline is:
+## Architecture
+
+All AI capabilities use two providers:
+
+| Capability | Provider | Model / Endpoint |
+|------------|----------|------------------|
+| **LLM** (script & keywords) | MiniMax | `M2-her` (`/v1/text/chatcompletion_v2`) |
+| **TTS** (voice synthesis) | MiniMax | `speech-2.6-hd` (`/v1/t2a_v2`) |
+| **Image** (material) | apimart | gemini-3 (`/v1/images/generations`) |
 
 ```text
-article_text → podcast_script → material search terms → podcast audio → subtitles → materials → final video
+article_text → MiniMax LLM (podcast script) → MiniMax LLM (keywords)
+            → apimart (one image per sentence)
+            → MiniMax TTS (one audio per speaker line)
+            → ffmpeg (images+audio → segments → concat)
+            → ffmpeg (mix background music)
+            → final video
 ```
+
+**No SiliconFlow.** LLM and TTS both use MiniMax exclusively. Image generation uses apimart. No Pexels/Pixabay keys required.
 
 ## Features
 
-- Podcast script generation from an article
-- Two-speaker voice selection and voice preview in WebUI
+- Podcast script generation from an article (MiniMax LLM)
+- Two-speaker voice selection and voice preview in WebUI (MiniMax TTS)
 - Podcast audio synthesis
-- Subtitle generation from podcast dialogue/audio
-- Material search from Pexels or Pixabay
-- Local material support
+- AI image generation per sentence (apimart)
+- Local material support (legacy)
+- Background music: random / custom track / none, with volume control
 - WebUI and HTTP API
-- Portrait and landscape video output
+- Portrait video output
+- **No subtitles** — videos contain image + voice + music only
 
 ## Requirements
 
-- Python 3.11 is recommended
-- FFmpeg
-- ImageMagick for subtitle rendering
-- Optional: GPU for Whisper subtitle generation
+- Python 3.11
+- FFmpeg + ffprobe on PATH (the WebUI calls `ffmpeg`/`ffprobe` directly by name)
+- **CPU only** — no CUDA/GPU/torch needed. No ImageMagick needed. No Whisper model download needed.
 
 ## Quick Start
 
@@ -53,26 +68,38 @@ copy config.example.toml config.toml  # Windows
 # cp config.example.toml config.toml  # macOS/Linux
 ```
 
-At minimum, configure:
+Edit `config.toml` — only two keys are required:
 
-- One LLM provider key, depending on `llm_provider`:
-  - `moonshot_api_key`, or
-  - `openai_api_key`, or
-  - `qwen_api_key`, `deepseek_api_key`, `gemini_api_key`, etc.
-- One material provider key:
-  - `pexels_api_keys`, or
-  - `pixabay_api_keys`
-- TTS keys only when using paid/non-Edge voices:
-  - `[azure].speech_key` and `[azure].speech_region`
-  - `[siliconflow].api_key`
-- Optional API authentication:
-  - set `auth_enabled = true`
-  - set `api_key` to a long random value
-  - send it with HTTP header `x-api-key`
+```toml
+[MiniMax]
+api_key = "your-minimax-key"     # REQUIRED: LLM (M2-her) + TTS (speech-2.6-hd)
+llm_model = "M2-her"
+tts_model = "speech-2.6-hd"
 
-Important: if a key was ever committed or shared, revoke it in the provider console and create a new one.
+[apimart]
+api_key = "your-apimart-key"     # REQUIRED: image generation (gemini-3)
+```
 
-### 4. Run WebUI
+The `[siliconflow]` section is deprecated and unused. No Pexels/Pixabay keys needed.
+
+Optional API authentication (for exposing the HTTP API):
+
+- set `auth_enabled = true`
+- set `api_key` to a long random value
+- send it with HTTP header `x-api-key`
+
+Important: if a key was ever committed or shared, **revoke it** in the provider console and create a new one — deleting it from a later commit does not remove it from git history.
+
+### 4. Verify environment
+
+```shell
+ffmpeg -version
+ffprobe -version
+```
+
+Both must be on PATH. If not, add FFmpeg's `bin` folder to your PATH. (The WebUI calls `ffmpeg`/`ffprobe` directly by name.)
+
+### 5. Run WebUI
 
 ```shell
 streamlit run webui/Main.py --server.address=0.0.0.0 --server.port=8501
@@ -84,7 +111,7 @@ Open:
 http://127.0.0.1:8501
 ```
 
-### 5. Run API
+### 6. Run API
 
 ```shell
 python main.py

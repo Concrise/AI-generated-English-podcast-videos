@@ -28,15 +28,15 @@ def mktimestamp(seconds: float) -> str:
 
 def get_MiniMax_voices() -> list[str]:
     """
-    获取 MiniMax 的英文声音列表
+    获取 MiniMax 的英文声音列表（已验证可用的 voice_id）
     文档: https://platform.minimaxi.com/document/T2A%20V2
     """
-    # MiniMax 英文音色（来自官方文档）
+    # MiniMax 英文音色（实测 speech-2.6-hd 可用）
     voices = [
         ("speech-2.6-hd", "English_PassionateWarrior", "Female"),
-        ("speech-2.6-hd", "English_Soft_Soothing", "Female"),
-        ("speech-2.6-hd", "English_Trustworth_Man", "Male"),
         ("speech-2.6-hd", "English_Graceful_Lady", "Female"),
+        ("speech-2.6-hd", "English_Cute_Girl", "Female"),
+        ("speech-2.6-hd", "English_Trustworth_Man", "Male"),
     ]
     return [
         f"MiniMax:{model}:{voice}-{gender}"
@@ -46,88 +46,12 @@ def get_MiniMax_voices() -> list[str]:
 
 def get_siliconflow_voices() -> list[str]:
     """
-    获取硅基流动的声音列表（从API获取）
-    如果 MiniMax 优先，则先返回 MiniMax 声音
+    返回可用声音列表。
+    本系统语音统一使用 MiniMax（T2A V2），不再使用 SiliconFlow TTS。
+    保留此函数名以兼容 WebUI 已有调用，实际只返回 MiniMax 音色，无需联网请求。
     """
-    api_key = config.siliconflow.get("api_key", "")
-    
-    # 如果有 MiniMax key，优先返回 MiniMax 声音
-    if config.MiniMax.get("api_key", ""):
-        MiniMax_voices = get_MiniMax_voices()
-        # 仍然保留 SiliconFlow 作为备选
-        MiniMax_voices.extend(_get_siliconflow_voices_internal(api_key))
-        return MiniMax_voices
-    
-    return _get_siliconflow_voices_internal(api_key)
+    return get_MiniMax_voices()
 
-
-def _get_siliconflow_voices_internal(api_key: str) -> list[str]:
-    """SiliconFlow 声音列表（内部使用）"""
-    
-    if not api_key:
-        logger.warning("SiliconFlow API key is not set, using default voices")
-        # 返回默认声音列表
-        voices_with_gender = [
-            ("FunAudioLLM/CosyVoice2-0.5B", "alex", "Male"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "anna", "Female"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "bella", "Female"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "benjamin", "Male"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "charles", "Male"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "claire", "Female"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "david", "Male"),
-            ("FunAudioLLM/CosyVoice2-0.5B", "diana", "Female"),
-        ]
-        return [
-            f"siliconflow:{model}:{voice}-{gender}"
-            for model, voice, gender in voices_with_gender
-        ]
-    
-    try:
-        url = "https://api.siliconflow.cn/v1/audio/voice/list"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            data = response.json()
-            voices = []
-            
-            if data and isinstance(data, list):
-                for voice_info in data:
-                    model = voice_info.get("model", "")
-                    voice = voice_info.get("voice", "")
-                    gender = voice_info.get("gender", "").capitalize()
-                    
-                    if model and voice:
-                        display_gender = gender if gender else "Unknown"
-                        voices.append(f"siliconflow:{model}:{voice}-{display_gender}")
-            
-            if voices:
-                logger.info(f"Successfully fetched {len(voices)} voices from SiliconFlow")
-                return voices
-            else:
-                logger.warning("No voices found in SiliconFlow response")
-        else:
-            logger.error(f"Failed to fetch voices from SiliconFlow: {response.status_code}")
-    
-    except Exception as e:
-        logger.error(f"Error fetching voices from SiliconFlow: {str(e)}")
-    
-    # 如果API调用失败，返回默认声音列表
-    voices_with_gender = [
-        ("FunAudioLLM/CosyVoice2-0.5B", "alex", "Male"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "anna", "Female"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "bella", "Female"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "benjamin", "Male"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "charles", "Male"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "claire", "Female"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "david", "Male"),
-        ("FunAudioLLM/CosyVoice2-0.5B", "diana", "Female"),
-    ]
-    return [
-        f"siliconflow:{model}:{voice}-{gender}"
-        for model, voice, gender in voices_with_gender
-    ]
 
 
 def get_all_azure_voices(filter_locals=None) -> list[str]:
@@ -1708,11 +1632,18 @@ def create_subtitle(sub_maker: submaker.SubMaker, text: str, subtitle_file: str)
 
 def get_audio_duration(sub_maker: submaker.SubMaker):
     """
-    获取音频时长
+    获取音频时长。兼容 edge-tts 的 offset 格式与 MiniMax/whisper 的 cues 格式。
     """
-    if not sub_maker.offset:
-        return 0.0
-    return sub_maker.offset[-1][1] / 10000000
+    # edge-tts 格式：offset 为 [(start, end), ...]（单位 100ns）
+    if getattr(sub_maker, "offset", None):
+        return sub_maker.offset[-1][1] / 10000000
+    # MiniMax/whisper 格式：cues 为 [Subtitle(...), ...]，end 为 timedelta（微秒）
+    cues = getattr(sub_maker, "cues", None)
+    if cues:
+        last_end = cues[-1].end
+        # timedelta.total_seconds()
+        return last_end.total_seconds()
+    return 0.0
 
 
 if __name__ == "__main__":

@@ -1,18 +1,29 @@
 [app]
+# 素材来源：本系统主用 AI 生成素材
+#   "MiniMax" : 使用 apimart/gemini 生成图片（默认，推荐）
+#   "pexels"  : 使用 Pexels 素材（需 pexels_api_keys）
+#   "pixabay" : 使用 Pixabay 素材（需 pixabay_api_keys）
+#   "local"   : 使用本地素材（需 video_materials）
 video_source = "MiniMax"
 hide_config = false
 
 [MiniMax]
-api_key = "sk-api-u7DlDQ8T0hfJ-x4gZp3CGiBZlUo6sH0xm779M0b2eLCP89aTdp0mu4E"
+# MiniMax 提供 LLM 与 TTS，是本系统主力 AI 提供商
+# 获取 Key: https://platform.minimaxi.com/
+# 推荐 LLM 模型（2026）：MiniMax-M2.5 / MiniMax-M2.7-highspeed
+api_key = ""
 base_url = "https://api.minimaxi.com/v1"
-llm_model = "M2-her"
+llm_model = "MiniMax-M2.5"
 tts_model = "speech-2.6-hd"
 
 [siliconflow]
-api_key = "sk-bppchrqflzyzlzpubgmqeqhaaobswqniui"
+# 已弃用：本系统不再使用 SiliconFlow，保留空占位避免旧代码报错
+api_key = ""
 
 [apimart]
-api_key = "sk-s4L8pbVGNijeMo9hMM60aMOt5"
+# apimart 用于 AI 生成图片素材（gemini-3）
+# 获取 Key: https://apimart.ai/
+api_key = ""
 
 [bgm]
 type = "random"
@@ -21,7 +32,7 @@ volume = 0.15
 [ui]
 hide_log = false
 language = "zh"
-tts_server = "siliconflow"
+tts_server = "minimax"
 font_name = "MicrosoftYaHeiBold.ttc"
 text_fore_color = "#FFFFFF"
 font_size = 60

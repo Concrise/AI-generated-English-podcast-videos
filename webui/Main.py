@@ -27,8 +27,46 @@ from app.services import podcast_audio
 from app.services.image_generator import generate_sentence_image
 from app.utils import utils
 from app.services.video import get_bgm_file
-from app.services.voice import get_siliconflow_voices, siliconflow_tts, get_audio_duration
+from app.services.voice import get_siliconflow_voices, siliconflow_tts, MiniMax_tts, get_audio_duration
 from app.services.voice import SubMaker
+
+
+def _synthesize_speech(voice_name: str, text: str, voice_file: str) -> "SubMaker | None":
+    """
+    统一语音合成入口：根据音色名前缀分发到对应 TTS 引擎。
+    本系统默认/主用 MiniMax TTS（音色名以 MiniMax: 开头）。
+    """
+    parts = voice_name.split(":")
+    if len(parts) < 3:
+        logger.error(f"❌ 无效的语音名称格式: {voice_name}")
+        return None
+
+    provider = parts[0].lower()
+    model = parts[1]
+    voice_with_gender = parts[2]
+    voice = voice_with_gender.split("-")[0]
+
+    if provider == "minimax":
+        # MiniMax_tts 直接接收 model 和 voice
+        return MiniMax_tts(
+            text=text,
+            model=model,
+            voice=voice,
+            voice_rate=1.0,
+            voice_file=voice_file,
+            voice_volume=1.0,
+        )
+    else:
+        # 兼容其它前缀（如历史 siliconflow:），仍按 model:voice 拼接调用
+        full_voice = f"{model}:{voice}"
+        return siliconflow_tts(
+            text=text,
+            model=model,
+            voice=full_voice,
+            voice_rate=1.0,
+            voice_file=voice_file,
+            voice_volume=1.0,
+        )
 
 # 页面配置
 st.set_page_config(
@@ -163,9 +201,10 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
 def generate_podcast_video(article_text: str, output_dir: str, 
                             dialogue_turns: int = 5,
                             difficulty: str = "middle",
-                            speaker_1_voice: str = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:anna-Female",
-                            speaker_2_voice: str = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:benjamin-Male",
-                            bgm_type: str = "random", bgm_volume: float = 0.2):
+                            speaker_1_voice: str = "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female",
+                            speaker_2_voice: str = "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male",
+                            bgm_type: str = "random", bgm_volume: float = 0.2,
+                            bgm_file: str = ""):
     """生成播客视频的完整流程"""
     
     results = {
@@ -222,37 +261,21 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 logger.info(f"   生成音频片段 {segment_index} (Speaker 1): {turn.speaker_1[:50]}...")
                 
                 try:
-                    # 解析语音名称
-                    voice_name = turn.speaker_1_voice
-                    parts = voice_name.split(":")
-                    if len(parts) >= 3:
-                        model = parts[1]
-                        voice_with_gender = parts[2]
-                        voice = voice_with_gender.split("-")[0]
-                        full_voice = f"{model}:{voice}"
-                        
-                        # 直接调用同步的 siliconflow_tts
-                        sub_maker = siliconflow_tts(
-                            text=turn.speaker_1,
-                            model=model,
-                            voice=full_voice,
-                            voice_rate=1.0,
-                            voice_file=audio_path,
-                            voice_volume=1.0
-                        )
-                        
-                        if sub_maker and os.path.exists(audio_path):
-                            duration = get_audio_duration(sub_maker)
-                            audio_segments.append((audio_path, duration, segment_index))
-                            logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
-                            segment_index += 1
-                        else:
-                            logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
-                            results["error"] = f"音频片段 {segment_index} 生成失败"
-                            return results
+                    # 统一语音合成（按音色前缀分发，主用 MiniMax TTS）
+                    sub_maker = _synthesize_speech(
+                        voice_name=turn.speaker_1_voice,
+                        text=turn.speaker_1,
+                        voice_file=audio_path,
+                    )
+
+                    if sub_maker and os.path.exists(audio_path):
+                        duration = get_audio_duration(sub_maker)
+                        audio_segments.append((audio_path, duration, segment_index))
+                        logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
+                        segment_index += 1
                     else:
-                        logger.error(f"   ❌ 无效的语音名称格式: {voice_name}")
-                        results["error"] = f"无效的语音名称格式: {voice_name}"
+                        logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
+                        results["error"] = f"音频片段 {segment_index} 生成失败"
                         return results
                 except Exception as e:
                     logger.error(f"   ❌ 音频生成异常: {str(e)}")
@@ -265,37 +288,21 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 logger.info(f"   生成音频片段 {segment_index} (Speaker 2): {turn.speaker_2[:50]}...")
                 
                 try:
-                    # 解析语音名称
-                    voice_name = turn.speaker_2_voice
-                    parts = voice_name.split(":")
-                    if len(parts) >= 3:
-                        model = parts[1]
-                        voice_with_gender = parts[2]
-                        voice = voice_with_gender.split("-")[0]
-                        full_voice = f"{model}:{voice}"
-                        
-                        # 直接调用同步的 siliconflow_tts
-                        sub_maker = siliconflow_tts(
-                            text=turn.speaker_2,
-                            model=model,
-                            voice=full_voice,
-                            voice_rate=1.0,
-                            voice_file=audio_path,
-                            voice_volume=1.0
-                        )
-                        
-                        if sub_maker and os.path.exists(audio_path):
-                            duration = get_audio_duration(sub_maker)
-                            audio_segments.append((audio_path, duration, segment_index))
-                            logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
-                            segment_index += 1
-                        else:
-                            logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
-                            results["error"] = f"音频片段 {segment_index} 生成失败"
-                            return results
+                    # 统一语音合成（按音色前缀分发，主用 MiniMax TTS）
+                    sub_maker = _synthesize_speech(
+                        voice_name=turn.speaker_2_voice,
+                        text=turn.speaker_2,
+                        voice_file=audio_path,
+                    )
+
+                    if sub_maker and os.path.exists(audio_path):
+                        duration = get_audio_duration(sub_maker)
+                        audio_segments.append((audio_path, duration, segment_index))
+                        logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
+                        segment_index += 1
                     else:
-                        logger.error(f"   ❌ 无效的语音名称格式: {voice_name}")
-                        results["error"] = f"无效的语音名称格式: {voice_name}"
+                        logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
+                        results["error"] = f"音频片段 {segment_index} 生成失败"
                         return results
                 except Exception as e:
                     logger.error(f"   ❌ 音频生成异常: {str(e)}")
@@ -438,23 +445,29 @@ def generate_podcast_video(article_text: str, output_dir: str,
         # 步骤6: 混合背景音乐
         if bgm_type and bgm_type != "none":
             st.info("🎵 正在添加背景音乐...")
-            bgm_file = get_bgm_file(bgm_type=bgm_type, bgm_file="")
-            
-            if bgm_file and os.path.exists(bgm_file):
-                logger.info(f"   使用背景音乐: {os.path.basename(bgm_file)}")
+            # custom 模式使用用户指定的曲目，random 模式让 get_bgm_file 随机选
+            resolved_bgm_file = bgm_file if (bgm_type == "custom" and bgm_file) else ""
+            if bgm_type != "custom":
+                resolved_bgm_file = get_bgm_file(bgm_type=bgm_type, bgm_file="")
+
+            if resolved_bgm_file and os.path.exists(resolved_bgm_file):
+                logger.info(f"   使用背景音乐: {os.path.basename(resolved_bgm_file)}")
                 final_video_with_bgm = os.path.join(output_dir, "final_video.mp4")
-                
+
                 # 使用 ffmpeg 混合语音和背景音乐
-                # 背景音乐循环播放直到视频结束，音量调整为 bgm_volume
-                bgm_filter = f"volume={bgm_volume}"
-                amix_filter = "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-                
+                # 关键：先用 volume 滤镜把背景音乐降到 bgm_volume，再 amix，
+                # 否则音量滑块无效（旧行为是死代码）。
+                filter_complex = (
+                    f"[1:a]volume={bgm_volume}[bg];"
+                    f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                )
+
                 cmd = [
                     'ffmpeg', '-y',
                     '-i', final_video,
                     '-stream_loop', '-1',
-                    '-i', bgm_file,
-                    '-filter_complex', amix_filter,
+                    '-i', resolved_bgm_file,
+                    '-filter_complex', filter_complex,
                     '-map', '0:v',
                     '-map', '[aout]',
                     '-c:v', 'copy',
@@ -464,23 +477,18 @@ def generate_podcast_video(article_text: str, output_dir: str,
                     '-threads', '2',
                     final_video_with_bgm
                 ]
-                
-                subprocess.run(cmd, capture_output=True, text=True)
-                
-                if os.path.exists(final_video_with_bgm):
+
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+
+                if os.path.exists(final_video_with_bgm) and os.path.getsize(final_video_with_bgm) > 0:
                     final_video = final_video_with_bgm
                     logger.info(f"   ✅ 背景音乐已添加 (音量: {bgm_volume})")
-                    # 删除临时无音乐版本
-                    try:
-                        temp_path = final_video_with_bgm.replace(".mp4", "_no_bgm.mp4")
-                        if os.path.exists(temp_path) and temp_path != final_video_with_bgm:
-                            pass
-                    except:
-                        pass
                 else:
-                    logger.warning(f"   ⚠️ 背景音乐混合失败，使用原始视频")
+                    logger.error(f"   ⚠️ 背景音乐混合失败: {proc.stderr[-300:] if proc.stderr else ''}")
+                    st.error("背景音乐混合失败，已使用无音乐版本")
             else:
                 logger.warning(f"   ⚠️ 未找到背景音乐文件")
+                st.warning("未找到背景音乐文件（检查 resource/songs 是否有 mp3），已使用无音乐版本")
                 # 重命名为最终文件名
                 final_video_with_bgm = os.path.join(output_dir, "final_video.mp4")
                 if os.path.exists(final_video):
@@ -578,8 +586,8 @@ with st.sidebar:
     male_voices = [v for v in available_voices if "Male" in v]
     female_voices = [v for v in available_voices if "Female" in v]
     
-    # 默认选择 anna (女声)
-    default_female = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:anna-Female"
+    # 默认选择 MiniMax 女声
+    default_female = "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female"
     if default_female not in female_voices and female_voices:
         default_female = female_voices[0]
     
@@ -591,8 +599,8 @@ with st.sidebar:
         key="speaker_1_voice_select"
     )
     
-    # 默认选择 benjamin (男声)
-    default_male = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:benjamin-Male"
+    # 默认选择 MiniMax 男声
+    default_male = "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male"
     if default_male not in male_voices and male_voices:
         default_male = male_voices[0]
     
@@ -608,14 +616,14 @@ with st.sidebar:
     
     # 音乐设置
     st.subheader("🎵 背景音乐")
-    
+
     bgm_type = st.selectbox(
         "音乐类型",
-        options=["random", "none"],
-        format_func=lambda x: "随机选择" if x == "random" else "无背景音乐",
+        options=["random", "custom", "none"],
+        format_func=lambda x: {"random": "随机选择", "custom": "指定曲目", "none": "无背景音乐"}[x],
         key="bgm_type_select"
     )
-    
+
     bgm_volume = st.slider(
         "音乐音量",
         min_value=0.0,
@@ -626,12 +634,27 @@ with st.sidebar:
         help="建议设置为 0.1-0.2，避免盖过语音",
         key="bgm_volume_slider"
     )
-    
-    # 显示可用音乐数量
+
+    # 音乐库列表与指定曲目选择
     song_dir = utils.song_dir()
-    mp3_files = [f for f in os.listdir(song_dir) if f.endswith('.mp3')] if os.path.exists(song_dir) else []
+    mp3_files = sorted([f for f in os.listdir(song_dir) if f.endswith('.mp3')]) if os.path.exists(song_dir) else []
     if mp3_files:
         st.caption(f"📂 音乐库: {len(mp3_files)} 个文件")
+
+    bgm_file = ""
+    if bgm_type == "custom":
+        if not mp3_files:
+            st.warning("音乐库为空（resource/songs 无 mp3），将无法添加背景音乐")
+        else:
+            selected_song = st.selectbox(
+                "选择曲目",
+                options=mp3_files,
+                key="bgm_song_select"
+            )
+            bgm_file = os.path.join(song_dir, selected_song) if selected_song else ""
+            if bgm_file and os.path.exists(bgm_file):
+                with open(bgm_file, "rb") as _af:
+                    st.audio(_af.read(), format="audio/mp3")
 
 # ===== 主界面 =====
 # 标题
@@ -755,7 +778,8 @@ if generate_btn and article_text.strip():
         speaker_1_voice=speaker_1_voice,
         speaker_2_voice=speaker_2_voice,
         bgm_type=bgm_type, 
-        bgm_volume=bgm_volume
+        bgm_volume=bgm_volume,
+        bgm_file=bgm_file
     )
     
     progress_bar.progress(100)

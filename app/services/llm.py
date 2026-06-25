@@ -1,6 +1,6 @@
 """
 LLM 服务
-支持 MiniMax (主要) 和 SiliconFlow (备选)
+统一使用 MiniMax (M2-her) 生成播客脚本与关键词
 参考文档: https://platform.minimaxi.com/document/ChatCompletion
 """
 import json
@@ -16,10 +16,9 @@ from app.models.schema import PodcastScript
 
 def _generate_response(prompt: str) -> str:
     """
-    使用 MiniMax API 生成响应 (主要)
-    SiliconFlow 作为备选
+    使用 MiniMax API 生成响应
     """
-    # 优先使用 MiniMax
+    # 使用 MiniMax
     MiniMax_key = config.MiniMax.get("api_key", "")
     if MiniMax_key:
         url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
@@ -38,42 +37,28 @@ def _generate_response(prompt: str) -> str:
             r = requests.post(url, json=payload, headers=headers, timeout=60)
             if r.status_code == 200:
                 data = r.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    logger.info(f"MiniMax LLM OK ({len(content)} chars)")
-                    return content
+                # MiniMax 在配额/错误时可能返回 "choices": null，必须先判空再取下标，
+                # 否则 None[0] 会抛 TypeError: 'NoneType' object is not subscriptable
+                choices = data.get("choices") or []
+                if not choices:
+                    # 记录 MiniMax 的错误信息（如有 base_resp）
+                    base_resp = data.get("base_resp") or {}
+                    status_msg = base_resp.get("status_msg") or base_resp.get("status_code")
+                    logger.warning(f"MiniMax LLM empty choices: {status_msg or data}")
                 else:
-                    logger.warning(f"MiniMax LLM empty content: {data}")
+                    message = choices[0].get("message") or {}
+                    content = message.get("content") or ""
+                    if content:
+                        logger.info(f"MiniMax LLM OK ({len(content)} chars)")
+                        return content
+                    else:
+                        logger.warning(f"MiniMax LLM empty content: {data}")
             else:
                 logger.warning(f"MiniMax LLM failed: {r.status_code} {r.text[:200]}")
         except Exception as e:
             logger.warning(f"MiniMax LLM error: {str(e)}")
 
-    # Fallback to SiliconFlow
-    sf_key = config.siliconflow.get("api_key", "")
-    if sf_key:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=sf_key, base_url="https://api.siliconflow.cn/v1")
-            for model_name in ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen2.5-7B-Instruct"]:
-                try:
-                    logger.info(f"Fallback to SiliconFlow: {model_name}")
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.7,
-                        max_tokens=2048
-                    )
-                    content = response.choices[0].message.content
-                    if content:
-                        return content
-                except Exception as e:
-                    logger.warning(f"SiliconFlow {model_name} failed: {e}")
-                    continue
-        except Exception as e:
-            logger.warning(f"SiliconFlow client error: {e}")
-
-    logger.error("All LLM providers failed")
+    logger.error("MiniMax LLM failed (no provider available)")
     return ""
 
 
@@ -127,37 +112,36 @@ def generate_podcast_script(article_text: str, language: str = "English", dialog
     
     diff_req = difficulty_requirements.get(difficulty, difficulty_requirements["middle"])
     
-    prompt = f"""
-    Create a podcast-style dialogue script based on the following article.
-    
-    Article:
-    {article_text}
-    
-    Requirements:
-    - Generate {language} dialogue between two speakers (Speaker 1 and Speaker 2)
-    - Each speaker should have natural, conversational responses
-    - Include exactly {dialogue_turns} dialogue turns
-    - Keep responses relatively short (2-3 sentences each)
-    - Focus on the main topics from the article
-    
-    Difficulty Level: {difficulty_desc.get(difficulty, "初中水平")}
-    {diff_req}
-    
-    Output format (JSON array):
-    [
-        {{
-            "speaker_1": "...",
-            "speaker_2": "..."
-        }},
-        ...
-    ]
-    """
+    prompt = f"""You are a dialogue generator. Output ONLY a valid JSON array, no other text, no markdown, no explanation.
+
+Generate a {dialogue_turns}-turn {language} conversation between two people based on this article.
+
+Article:
+{article_text}
+
+Rules:
+- speaker_1 asks or opens, speaker_2 responds naturally
+- 1-2 sentences each, conversational and friendly
+- Focus on the article's main ideas
+{diff_req}
+
+Respond with ONLY this JSON structure (exactly {dialogue_turns} objects):
+[{{"speaker_1": "...", "speaker_2": "..."}}, {{"speaker_1": "...", "speaker_2": "..."}}]
+"""
 
     response = _generate_response(prompt)
-    
+
+    if not response or not response.strip():
+        logger.error("LLM returned empty response, cannot generate podcast script")
+        return []
+
+    # 去除 markdown 代码围栏（```json ... ``` 或 ``` ... ```），
+    # 否则 json.loads 会失败并误入文本兜底解析
+    cleaned = _strip_code_fences(response)
+
     try:
         # 尝试解析 JSON
-        script_data = json.loads(response)
+        script_data = json.loads(cleaned)
         result = []
         for item in script_data:
             script = PodcastScript(
@@ -167,6 +151,8 @@ def generate_podcast_script(article_text: str, language: str = "English", dialog
                 speaker_2_voice=""
             )
             result.append(script)
+        if not result:
+            logger.warning("Parsed JSON produced empty podcast script")
         return result
     except json.JSONDecodeError:
         # 如果 JSON 解析失败，尝试从文本中提取对话
@@ -174,33 +160,89 @@ def generate_podcast_script(article_text: str, language: str = "English", dialog
         return _parse_dialogue_from_text(response)
 
 
+def _strip_code_fences(text: str) -> str:
+    """去除 markdown 代码围栏，返回纯 JSON 文本"""
+    s = text.strip()
+    # 去除开头的 ```json 或 ```
+    if s.startswith("```"):
+        first_newline = s.find("\n")
+        if first_newline != -1:
+            s = s[first_newline + 1:]
+        else:
+            s = s[3:]
+    # 去除结尾的 ```
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
+
+
+
 def _parse_dialogue_from_text(text: str) -> List[PodcastScript]:
     """
-    从文本中解析对话
+    从文本中解析对话。兼容两种格式：
+    1. 换行分隔：每行 "Speaker 1:" / "Speaker 2:" 开头
+    2. 内联连续：同一行内多次出现 "Speaker 1:" / "Speaker 2:"（M2-her 模型常见）
+    用正则把所有说话人片段提取出来，再按 S1->S2 配对成 PodcastScript。
     """
+    if not text:
+        return []
+
+    # 正则匹配 "Speaker 1:" 或 "A:" 或 "Speaker 2:" 或 "B:" 标记
+    # 命名分组：speaker=1或A 视为说话人1，speaker=2或B 视为说话人2
+    pattern = re.compile(
+        r'(?:Speaker\s*([12])\s*:|([AB])\s*:)',
+        re.IGNORECASE,
+    )
+
+    # 找到所有标记位置，提取每段文本
+    matches = list(pattern.finditer(text))
+    if not matches:
+        logger.warning("no speaker markers found in text")
+        return []
+
+    segments = []  # [(who, content), ...]  who=1 or 2
+    for i, m in enumerate(matches):
+        # 判断说话人
+        if m.group(1):
+            who = int(m.group(1))
+        else:
+            who = 1 if m.group(2).upper() == "A" else 2
+        # 内容 = 从本标记后到下一标记前
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        content = text[start:end].strip()
+        # 清理多余空白和舞台指示
+        content = re.sub(r'\s+', ' ', content).strip()
+        if content:
+            segments.append((who, content))
+
+    # 按 (说话人1, 说话人2) 配对
     result = []
-    lines = text.split('\n')
-    
-    current_script = None
-    for line in lines:
-        line = line.strip()
-        if line.startswith("Speaker 1:") or line.startswith("A:"):
-            if current_script:
-                result.append(current_script)
-            speaker_1 = line.replace("Speaker 1:", "").replace("A:", "").strip()
-            current_script = PodcastScript(
-                speaker_1=speaker_1,
+    current = None
+    for who, content in segments:
+        if who == 1:
+            if current and (current.speaker_1 or current.speaker_2):
+                result.append(current)
+            current = PodcastScript(
+                speaker_1=content,
                 speaker_2="",
                 speaker_1_voice="",
-                speaker_2_voice=""
+                speaker_2_voice="",
             )
-        elif line.startswith("Speaker 2:") or line.startswith("B:"):
-            if current_script:
-                current_script.speaker_2 = line.replace("Speaker 2:", "").replace("B:", "").strip()
-    
-    if current_script and (current_script.speaker_1 or current_script.speaker_2):
-        result.append(current_script)
-    
+        else:  # who == 2
+            if current is None:
+                # 没有前置的 speaker1，创建一个空的
+                current = PodcastScript(
+                    speaker_1="",
+                    speaker_2=content,
+                    speaker_1_voice="",
+                    speaker_2_voice="",
+                )
+            else:
+                current.speaker_2 = content
+    if current and (current.speaker_1 or current.speaker_2):
+        result.append(current)
+
     return result
 
 
