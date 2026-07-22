@@ -24,6 +24,7 @@ from app.config import config
 from app.models.schema import PodcastScript, VideoAspect
 from app.services import llm
 from app.services import podcast_audio
+from app.services.concurrency import GenerationTask, run_generation_tasks
 from app.services.image_generator import generate_sentence_image
 from app.services.media_utils import (
     MediaProcessingError,
@@ -287,13 +288,112 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
         remove_file_safely(temporary_output_path)
 
 
+def _build_utterance_specs(podcast_script: list[PodcastScript]) -> list[dict]:
+    """Create a stable ordered manifest shared by audio and image generation."""
+    utterances = []
+    for turn_index, turn in enumerate(podcast_script):
+        for speaker_number, text, voice_name in (
+            (1, turn.speaker_1, turn.speaker_1_voice),
+            (2, turn.speaker_2, turn.speaker_2_voice),
+        ):
+            if not text or not text.strip():
+                continue
+            segment_index = len(utterances)
+            utterances.append(
+                {
+                    "utterance_id": f"turn_{turn_index:03d}_speaker_{speaker_number}",
+                    "segment_index": segment_index,
+                    "speaker_number": speaker_number,
+                    "text": text.strip(),
+                    "voice_name": voice_name,
+                }
+            )
+    return utterances
+
+
+def _generate_audio_artifact(utterance: dict, output_dir: str) -> tuple[str, float, int]:
+    """Generate and validate one utterance audio artifact."""
+    segment_index = utterance["segment_index"]
+    speaker_number = utterance["speaker_number"]
+    audio_path = os.path.join(
+        output_dir,
+        f"audio_segment_{segment_index}_speaker{speaker_number}.mp3",
+    )
+    logger.info(
+        f"生成音频片段 {segment_index} ({utterance['utterance_id']}): "
+        f"{utterance['text'][:50]}..."
+    )
+
+    sub_maker = _synthesize_speech(
+        voice_name=utterance["voice_name"],
+        text=utterance["text"],
+        voice_file=audio_path,
+    )
+    if not sub_maker or not os.path.exists(audio_path):
+        raise RuntimeError(f"音频生成失败: {utterance['utterance_id']}")
+
+    duration = _get_audio_file_duration(audio_path)
+    if duration <= 0:
+        raise RuntimeError(f"无法读取音频时长: {utterance['utterance_id']}")
+
+    logger.info(f"音频片段 {segment_index}: {duration:.2f}秒 ✅")
+    return audio_path, duration, segment_index
+
+
+def _generate_image_artifact(
+    utterance: dict,
+    output_dir: str,
+    sentence_keywords: dict,
+    video_terms: list[str],
+) -> str:
+    """Generate one image or a validated local fallback for an utterance."""
+    segment_index = utterance["segment_index"]
+    speaker_number = utterance["speaker_number"]
+    output_path = os.path.join(
+        output_dir,
+        f"image_{segment_index}_speaker{speaker_number}.png",
+    )
+    keywords = sentence_keywords.get(segment_index, video_terms)
+
+    try:
+        result = generate_sentence_image(
+            sentence=utterance["text"],
+            keywords=keywords,
+            output_path=output_path,
+        )
+    except Exception as error:
+        logger.warning(
+            f"图片 {segment_index} AI生成异常，使用本地备选图片: {error}"
+        )
+        result = ""
+
+    if result and _is_valid_generated_image(result):
+        logger.info(f"图片 {segment_index}: AI生成成功, 关键词={keywords} ✅")
+        return result
+
+    logger.warning(f"图片 {segment_index}: AI生成失败，使用PIL备选图片")
+    fallback_path = generate_fallback_image(
+        sentence=utterance["text"],
+        keywords=keywords,
+        output_path=output_path,
+        speaker=f"Speaker {speaker_number}",
+    )
+    validate_image_file(fallback_path)
+    logger.info(f"图片 {segment_index}: PIL备选图片 ✅")
+    return fallback_path
+
+
 def generate_podcast_video(article_text: str, output_dir: str, 
                             dialogue_turns: int = 5,
                             difficulty: str = "middle",
                             speaker_1_voice: str = "gemini:Kore",
                             speaker_2_voice: str = "gemini:Puck",
                             bgm_type: str = "random", bgm_volume: float = 0.2,
-                            bgm_file: str = ""):
+                            bgm_file: str = "",
+                            concurrent_llm_requests: bool = False,
+                            concurrent_audio_requests: bool = False,
+                            concurrent_image_requests: bool = False,
+                            max_concurrent_requests: int = 3):
     """生成播客视频的完整流程"""
     
     results = {
@@ -328,148 +428,77 @@ def generate_podcast_video(article_text: str, output_dir: str,
         results["script"] = podcast_script
         logger.info(f"✅ 成功生成 {len(podcast_script)} 轮对话")
         
-        # 步骤2: 一次性提取每个句子的关键词
+        # 步骤2: 提取句子关键词和全局关键词。这两个 LLM 请求相互独立，
+        # 可按 WebUI 设置并发；脚本生成本身是后续步骤的依赖，始终先完成。
         st.info("🔑 正在提取关键词...")
-        sentence_keywords = llm.generate_terms_for_each_sentence(podcast_script=podcast_script, amount=3)
-        
-        # 同时提取全局关键词用于显示
-        video_terms = llm.generate_terms_from_podcast(podcast_script=podcast_script, amount=5)
+        llm_results = run_generation_tasks(
+            [
+                GenerationTask(
+                    name="逐句关键词提取",
+                    execute=lambda: llm.generate_terms_for_each_sentence(
+                        podcast_script=podcast_script,
+                        amount=3,
+                    ),
+                ),
+                GenerationTask(
+                    name="全局关键词提取",
+                    execute=lambda: llm.generate_terms_from_podcast(
+                        podcast_script=podcast_script,
+                        amount=5,
+                    ),
+                ),
+            ],
+            concurrent=concurrent_llm_requests,
+            max_workers=max_concurrent_requests,
+        )
+        sentence_keywords, video_terms = llm_results
         results["terms"] = video_terms
         logger.info(f"✅ 全局关键词: {', '.join(video_terms)}")
         logger.info(f"✅ 已为 {len(sentence_keywords)} 个句子提取独立关键词")
         
-        # 步骤3: 生成音频片段（直接使用 siliconflow_tts）
+        utterances = _build_utterance_specs(podcast_script)
+        if not utterances:
+            raise RuntimeError("播客脚本没有可生成的对话句子")
+
+        # 步骤3: 按稳定的 utterance 顺序生成音频。并发模式只改变请求
+        # 调度方式，结果仍按原顺序返回，后续音画关联保持一致。
         st.info("🔊 正在生成语音音频...")
-        audio_segments = []
-        segment_index = 0
-        
-        for turn_idx, turn in enumerate(podcast_script, 1):
-            # Speaker 1 音频
-            if turn.speaker_1:
-                audio_path = os.path.join(output_dir, f"audio_segment_{segment_index}_speaker1.mp3")
-                logger.info(f"   生成音频片段 {segment_index} (Speaker 1): {turn.speaker_1[:50]}...")
-                
-                try:
-                    # 统一语音合成（按音色前缀分发，主用 MiniMax TTS）
-                    sub_maker = _synthesize_speech(
-                        voice_name=turn.speaker_1_voice,
-                        text=turn.speaker_1,
-                        voice_file=audio_path,
-                    )
+        audio_segments = run_generation_tasks(
+            [
+                GenerationTask(
+                    name=f"音频 {utterance['utterance_id']}",
+                    execute=lambda utterance=utterance: _generate_audio_artifact(
+                        utterance,
+                        output_dir,
+                    ),
+                )
+                for utterance in utterances
+            ],
+            concurrent=concurrent_audio_requests,
+            max_workers=max_concurrent_requests,
+        )
 
-                    if sub_maker and os.path.exists(audio_path):
-                        duration = _get_audio_file_duration(audio_path)
-                        if duration <= 0:
-                            raise RuntimeError("Unable to read generated audio duration")
-                        audio_segments.append((audio_path, duration, segment_index))
-                        logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
-                        segment_index += 1
-                    else:
-                        logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
-                        results["error"] = f"音频片段 {segment_index} 生成失败"
-                        return results
-                except Exception as e:
-                    logger.error(f"   ❌ 音频生成异常: {str(e)}")
-                    results["error"] = f"音频生成异常: {str(e)}"
-                    return results
-            
-            # Speaker 2 音频
-            if turn.speaker_2:
-                audio_path = os.path.join(output_dir, f"audio_segment_{segment_index}_speaker2.mp3")
-                logger.info(f"   生成音频片段 {segment_index} (Speaker 2): {turn.speaker_2[:50]}...")
-                
-                try:
-                    # 统一语音合成（按音色前缀分发，主用 MiniMax TTS）
-                    sub_maker = _synthesize_speech(
-                        voice_name=turn.speaker_2_voice,
-                        text=turn.speaker_2,
-                        voice_file=audio_path,
-                    )
-
-                    if sub_maker and os.path.exists(audio_path):
-                        duration = _get_audio_file_duration(audio_path)
-                        if duration <= 0:
-                            raise RuntimeError("Unable to read generated audio duration")
-                        audio_segments.append((audio_path, duration, segment_index))
-                        logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
-                        segment_index += 1
-                    else:
-                        logger.error(f"   ❌ 音频片段 {segment_index} 生成失败")
-                        results["error"] = f"音频片段 {segment_index} 生成失败"
-                        return results
-                except Exception as e:
-                    logger.error(f"   ❌ 音频生成异常: {str(e)}")
-                    results["error"] = f"音频生成异常: {str(e)}"
-                    return results
-        
         results["audio_segments"] = audio_segments
         logger.info(f"✅ 共生成 {len(audio_segments)} 个音频片段")
         
-        # 步骤4: 生成教育图片（每个图片使用对应的关键词）
+        # 步骤4: 每个 utterance 独立生图；串行和并发共用同一实现。
         st.info("🖼️ 正在生成教育图片...")
-        image_paths = []
-        image_index = 0
-        
-        for turn_idx, turn in enumerate(podcast_script, 1):
-            # Speaker 1 图片
-            if turn.speaker_1:
-                output_path = os.path.join(output_dir, f"image_{image_index}_speaker1.png")
-                # 使用该句子对应的关键词
-                keywords = sentence_keywords.get(image_index, video_terms)
-                
-                # 尝试 AI 生成图片
-                result = generate_sentence_image(
-                    sentence=turn.speaker_1,
-                    keywords=keywords,
-                    output_path=output_path
+        image_paths = run_generation_tasks(
+            [
+                GenerationTask(
+                    name=f"图片 {utterance['utterance_id']}",
+                    execute=lambda utterance=utterance: _generate_image_artifact(
+                        utterance,
+                        output_dir,
+                        sentence_keywords,
+                        video_terms,
+                    ),
                 )
-                
-                # 如果 AI 生成失败，使用 PIL 备选图片
-                if result and _is_valid_generated_image(result):
-                    image_paths.append(result)
-                    logger.info(f"   图片 {image_index}: AI生成成功, 关键词={keywords} ✅")
-                else:
-                    logger.warning(f"   图片 {image_index}: AI生成失败，使用PIL备选图片")
-                    fallback_path = generate_fallback_image(
-                        sentence=turn.speaker_1,
-                        keywords=keywords,
-                        output_path=output_path,
-                        speaker="Speaker 1"
-                    )
-                    image_paths.append(fallback_path)
-                    logger.info(f"   图片 {image_index}: PIL备选图片 ✅")
-                
-                image_index += 1
-            
-            # Speaker 2 图片
-            if turn.speaker_2:
-                output_path = os.path.join(output_dir, f"image_{image_index}_speaker2.png")
-                # 使用该句子对应的关键词
-                keywords = sentence_keywords.get(image_index, video_terms)
-                
-                # 尝试 AI 生成图片
-                result = generate_sentence_image(
-                    sentence=turn.speaker_2,
-                    keywords=keywords,
-                    output_path=output_path
-                )
-                
-                # 如果 AI 生成失败，使用 PIL 备选图片
-                if result and _is_valid_generated_image(result):
-                    image_paths.append(result)
-                    logger.info(f"   图片 {image_index}: AI生成成功, 关键词={keywords} ✅")
-                else:
-                    logger.warning(f"   图片 {image_index}: AI生成失败，使用PIL备选图片")
-                    fallback_path = generate_fallback_image(
-                        sentence=turn.speaker_2,
-                        keywords=keywords,
-                        output_path=output_path,
-                        speaker="Speaker 2"
-                    )
-                    image_paths.append(fallback_path)
-                    logger.info(f"   图片 {image_index}: PIL备选图片 ✅")
-                
-                image_index += 1
+                for utterance in utterances
+            ],
+            concurrent=concurrent_image_requests,
+            max_workers=max_concurrent_requests,
+        )
         
         results["images"] = image_paths
         logger.info(f"✅ 共生成 {len(image_paths)} 张图片（确保与音频片段数量一致）")
@@ -729,6 +758,60 @@ with st.sidebar:
     st.caption(f"📊 将生成 {dialogue_turns} 轮对话（{dialogue_turns * 2} 个片段）")
     
     st.divider()
+
+    # 请求并发设置。三个阶段分别控制，便于对不支持并发的上游保持串行。
+    st.subheader("⚡ 请求并发")
+    st.caption("默认全部串行；只有确认上游支持并发时再开启。")
+
+    concurrent_llm_requests = st.checkbox(
+        "LLM 关键词请求并发",
+        value=False,
+        help=(
+            "并发执行逐句关键词和全局关键词两个独立请求。"
+            "播客脚本生成仍会先串行完成，因为后续步骤依赖它。"
+        ),
+        key="concurrent_llm_requests_checkbox",
+    )
+    concurrent_audio_requests = st.checkbox(
+        "音频请求并发",
+        value=False,
+        help="并发生成各句 TTS；不支持并发或限流严格的上游请关闭。",
+        key="concurrent_audio_requests_checkbox",
+    )
+    concurrent_image_requests = st.checkbox(
+        "图片请求并发",
+        value=False,
+        help="并发生成各句图片；任务型生图上游并发受限时请关闭。",
+        key="concurrent_image_requests_checkbox",
+    )
+
+    any_concurrent_requests = any(
+        (
+            concurrent_llm_requests,
+            concurrent_audio_requests,
+            concurrent_image_requests,
+        )
+    )
+    max_concurrent_requests = int(
+        st.number_input(
+            "最大并发请求数",
+            min_value=1,
+            max_value=10,
+            value=3,
+            step=1,
+            disabled=not any_concurrent_requests,
+            help="所有已开启阶段共用此单阶段并发上限，建议从 2 或 3 开始。",
+            key="max_concurrent_requests_input",
+        )
+    )
+    if any_concurrent_requests:
+        st.warning(
+            "并发可能触发上游限流、连接数限制或额外计费；出现 429/超时请降低并发或改回串行。"
+        )
+    else:
+        st.caption("当前模式：所有 LLM、音频和图片请求串行发送。")
+
+    st.divider()
     
     # 语音设置（Gemini TTS）
     st.subheader("🎙️ 语音设置")
@@ -919,15 +1002,19 @@ if generate_btn and article_text.strip():
     
     # 运行生成流程
     results = generate_podcast_video(
-        article_text, 
-        output_dir, 
+        article_text,
+        output_dir,
         dialogue_turns=dialogue_turns,
         difficulty=difficulty,
         speaker_1_voice=speaker_1_voice,
         speaker_2_voice=speaker_2_voice,
-        bgm_type=bgm_type, 
+        bgm_type=bgm_type,
         bgm_volume=bgm_volume,
-        bgm_file=bgm_file
+        bgm_file=bgm_file,
+        concurrent_llm_requests=concurrent_llm_requests,
+        concurrent_audio_requests=concurrent_audio_requests,
+        concurrent_image_requests=concurrent_image_requests,
+        max_concurrent_requests=max_concurrent_requests,
     )
     
     progress_bar.progress(100)

@@ -11,6 +11,11 @@ from pydantic import ValidationError
 from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.models import const
 from app.models.schema import VideoAspect, VideoParams
+from app.services.concurrency import (
+    GenerationTask,
+    GenerationTaskError,
+    run_generation_tasks,
+)
 from app.services.media_utils import (
     MediaProcessingError,
     run_media_command,
@@ -122,6 +127,107 @@ def test_task_manager_never_exceeds_configured_concurrency():
 def test_task_manager_rejects_non_positive_concurrency():
     with pytest.raises(ValueError):
         InMemoryTaskManager(max_concurrent_tasks=0)
+
+
+def test_generation_tasks_use_serial_execution_when_concurrency_is_disabled():
+    execution_order = []
+
+    def create_task(task_index):
+        def execute_task():
+            execution_order.append(task_index)
+            return task_index
+
+        return GenerationTask(name=f"task-{task_index}", execute=execute_task)
+
+    results = run_generation_tasks(
+        [create_task(task_index) for task_index in range(4)],
+        concurrent=False,
+        max_workers=4,
+    )
+
+    assert results == [0, 1, 2, 3]
+    assert execution_order == [0, 1, 2, 3]
+
+
+def test_generation_tasks_preserve_input_order_when_completion_order_differs():
+    second_task_completed = threading.Event()
+
+    def execute_first_task():
+        assert second_task_completed.wait(timeout=2)
+        return "first"
+
+    def execute_second_task():
+        second_task_completed.set()
+        return "second"
+
+    results = run_generation_tasks(
+        [
+            GenerationTask(name="first", execute=execute_first_task),
+            GenerationTask(name="second", execute=execute_second_task),
+        ],
+        concurrent=True,
+        max_workers=2,
+    )
+
+    assert results == ["first", "second"]
+
+
+def test_generation_tasks_respect_maximum_worker_count():
+    active_lock = threading.Lock()
+    active_tasks = 0
+    peak_active_tasks = 0
+
+    def execute_task():
+        nonlocal active_tasks, peak_active_tasks
+        with active_lock:
+            active_tasks += 1
+            peak_active_tasks = max(peak_active_tasks, active_tasks)
+        time.sleep(0.05)
+        with active_lock:
+            active_tasks -= 1
+        return True
+
+    tasks = [
+        GenerationTask(name=f"task-{task_index}", execute=execute_task)
+        for task_index in range(9)
+    ]
+    results = run_generation_tasks(tasks, concurrent=True, max_workers=3)
+
+    assert results == [True] * 9
+    assert peak_active_tasks == 3
+
+
+def test_generation_tasks_allow_none_as_a_valid_ordered_result():
+    results = run_generation_tasks(
+        [
+            GenerationTask(name="none-result", execute=lambda: None),
+            GenerationTask(name="value-result", execute=lambda: "value"),
+        ],
+        concurrent=True,
+        max_workers=2,
+    )
+
+    assert results == [None, "value"]
+
+
+def test_generation_tasks_report_the_failed_task_name():
+    def raise_provider_error():
+        raise RuntimeError("provider rejected concurrent request")
+
+    with pytest.raises(GenerationTaskError, match="image-request-2"):
+        run_generation_tasks(
+            [
+                GenerationTask(name="image-request-1", execute=lambda: "ok"),
+                GenerationTask(name="image-request-2", execute=raise_provider_error),
+            ],
+            concurrent=True,
+            max_workers=2,
+        )
+
+
+def test_generation_tasks_reject_non_positive_worker_count():
+    with pytest.raises(ValueError, match="positive integer"):
+        run_generation_tasks([], concurrent=True, max_workers=0)
 
 
 def test_image_validation_rejects_non_image_content(tmp_path):
