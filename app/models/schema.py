@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 warnings.filterwarnings("ignore", category=UserWarning, message="Field name.*shadows an attribute in parent.*")
 
@@ -25,11 +25,11 @@ class VideoAspect(str, Enum):
     square = "1:1"
 
     def to_resolution(self):
-        if self == VideoAspect.landscape.value:
+        if self == VideoAspect.landscape:
             return 1920, 1080
-        elif self == VideoAspect.portrait.value:
+        elif self == VideoAspect.portrait:
             return 1080, 1920
-        elif self == VideoAspect.square.value:
+        elif self == VideoAspect.square:
             return 1080, 1080
         return 1080, 1920
 
@@ -41,41 +41,45 @@ class MaterialInfo:
 
 class PodcastScript(BaseModel):
     """播客对话脚本"""
-    speaker_1: str
-    speaker_2: str
-    speaker_1_voice: str
-    speaker_2_voice: str
+    model_config = ConfigDict(validate_default=True)
+
+    speaker_1: str = Field(min_length=1, max_length=4000)
+    speaker_2: str = Field(min_length=1, max_length=4000)
+    speaker_1_voice: str = Field(min_length=1, max_length=200)
+    speaker_2_voice: str = Field(min_length=1, max_length=200)
 
 class VideoParams(BaseModel):
     """播客视频生成参数"""
-    article_text: str = ""
-    podcast_script: Optional[List[PodcastScript]] = None
-    video_terms: Optional[str | list] = None
-    video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
-    video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
-    video_transition_mode: Optional[VideoTransitionMode] = VideoTransitionMode.none
-    video_clip_duration: Optional[int] = 5
-    video_count: Optional[int] = 1
-    video_source: Optional[str] = "local"
+    model_config = ConfigDict(validate_default=True)
+
+    article_text: str = Field(default="", max_length=50000)
+    podcast_script: Optional[List[PodcastScript]] = Field(default=None, max_length=40)
+    video_terms: Optional[str | List[str]] = None
+    video_aspect: VideoAspect = VideoAspect.portrait
+    video_concat_mode: VideoConcatMode = VideoConcatMode.random
+    video_transition_mode: VideoTransitionMode = VideoTransitionMode.none
+    video_clip_duration: int = Field(default=5, ge=1, le=60)
+    video_count: int = Field(default=1, ge=1, le=10)
+    video_source: str = Field(default="local", max_length=50)
     video_materials: Optional[List[MaterialInfo]] = None
-    video_language: Optional[str] = ""
-    speaker_1_voice: str = "zh-CN-XiaoxiaoNeural-Female"
-    speaker_2_voice: str = "zh-CN-YunxiNeural-Male"
-    voice_volume: Optional[float] = 1.0
-    voice_rate: Optional[float] = 1.0
-    bgm_type: Optional[str] = "random"
-    bgm_file: Optional[str] = ""
-    bgm_volume: Optional[float] = 0.2
-    subtitle_enabled: Optional[bool] = True
-    subtitle_position: Optional[str] = "bottom"
-    custom_position: float = 70.0
-    font_name: Optional[str] = "STHeitiMedium.ttc"
-    text_fore_color: Optional[str] = "#FFFFFF"
+    video_language: str = Field(default="", max_length=50)
+    speaker_1_voice: str = Field(default="gemini:Kore", min_length=1, max_length=200)
+    speaker_2_voice: str = Field(default="gemini:Puck", min_length=1, max_length=200)
+    voice_volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    voice_rate: float = Field(default=1.0, ge=0.5, le=2.0)
+    bgm_type: str = Field(default="random", max_length=20)
+    bgm_file: str = Field(default="", max_length=1000)
+    bgm_volume: float = Field(default=0.2, ge=0.0, le=1.0)
+    subtitle_enabled: bool = False
+    subtitle_position: str = Field(default="bottom", pattern="^(bottom|top|center|custom)$")
+    custom_position: float = Field(default=70.0, ge=0.0, le=100.0)
+    font_name: str = Field(default="STHeitiMedium.ttc", max_length=200)
+    text_fore_color: str = Field(default="#FFFFFF", max_length=32)
     text_background_color: Union[bool, str] = True
-    font_size: int = 60
-    stroke_color: Optional[str] = "#000000"
-    stroke_width: float = 1.5
-    n_threads: Optional[int] = 2
+    font_size: int = Field(default=60, ge=12, le=180)
+    stroke_color: str = Field(default="#000000", max_length=32)
+    stroke_width: float = Field(default=1.5, ge=0.0, le=10.0)
+    n_threads: int = Field(default=2, ge=1, le=16)
 
 class SubtitleRequest(VideoParams):
     """播客字幕生成请求"""
@@ -89,16 +93,16 @@ class AudioRequest(VideoParams):
 
 class PodcastScriptRequest(BaseModel):
     """播客脚本生成请求"""
-    article_text: str = ""
-    language: Optional[str] = ""
-    speaker_1_voice: Optional[str] = "zh-CN-XiaoxiaoNeural-Female"
-    speaker_2_voice: Optional[str] = "zh-CN-YunxiNeural-Male"
+    article_text: str = Field(min_length=1, max_length=50000)
+    language: str = Field(default="English", max_length=50)
+    speaker_1_voice: str = Field(default="gemini:Kore", max_length=200)
+    speaker_2_voice: str = Field(default="gemini:Puck", max_length=200)
 
 
 class PodcastTermsRequest(BaseModel):
     """播客素材关键词生成请求"""
-    podcast_script: Optional[List[PodcastScript]] = None
-    amount: Optional[int] = 5
+    podcast_script: List[PodcastScript] = Field(min_length=1, max_length=40)
+    amount: int = Field(default=5, ge=1, le=20)
 
 class BaseResponse(BaseModel):
     status: int = 200

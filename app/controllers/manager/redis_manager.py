@@ -19,7 +19,7 @@ class RedisTaskManager(TaskManager):
         super().__init__(max_concurrent_tasks)
 
     def create_queue(self):
-        return "task_queue"
+        return "task:queue"
 
     def enqueue(self, task: Dict):
         task_with_serializable_params = task.copy()
@@ -29,7 +29,7 @@ class RedisTaskManager(TaskManager):
         ):
             task_with_serializable_params["kwargs"]["params"] = task["kwargs"][
                 "params"
-            ].dict()
+            ].model_dump(mode="json")
 
         # 将函数对象转换为其名称
         task_with_serializable_params["func"] = task["func"].__name__

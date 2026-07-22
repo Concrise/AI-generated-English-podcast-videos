@@ -1,28 +1,22 @@
-"""
-素材服务 - 简化版
-仅支持 SiliconFlow 图片生成
-"""
+"""Image material service used by the API pipeline."""
 import os
 from typing import List
 
 from loguru import logger
 
 from app.models.schema import VideoAspect
+from app.services.media_utils import MediaProcessingError, validate_image_file
 from app.utils import utils
 
 # 图片生成服务
 try:
-    from app.services.image_generator import (
-        generate_word_image,
-        generate_educational_image,
-        extract_words_with_phonetics,
-        generate_word_images_from_script,
+    # Import only the symbol this module actually uses. Importing a removed
+    # helper used to disable the entire API image pipeline.
+    from app.services.image_generator import generate_word_images_from_script
+except ImportError as error:
+    logger.warning(
+        f"image_generator module not available; image generation disabled: {error}"
     )
-except ImportError:
-    logger.warning("image_generator module not found, image generation features disabled")
-    generate_word_image = None
-    generate_educational_image = None
-    extract_words_with_phonetics = None
     generate_word_images_from_script = None
 
 
@@ -50,18 +44,32 @@ def generate_image_materials(
         logger.error("image_generator module not available")
         return []
     
-    image_paths = []
     task_dir = utils.task_dir(task_id)
     images_dir = os.path.join(task_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
     
     # 使用 image_generator 的批量生成函数
-    image_paths = generate_word_images_from_script(
+    generated_paths = generate_word_images_from_script(
         script=script,
         keywords=keywords,
         output_dir=images_dir,
         max_images=max_images
     )
-    
-    logger.success(f"Generated {len(image_paths)} images for task {task_id}")
-    return image_paths
+
+    valid_image_paths = []
+    for image_path in generated_paths:
+        try:
+            valid_image_paths.append(validate_image_file(image_path))
+        except MediaProcessingError as error:
+            logger.error(f"Discarding invalid generated image: {error}")
+
+    if len(valid_image_paths) != len(generated_paths):
+        logger.warning(
+            "Image material generation returned invalid files: "
+            f"valid={len(valid_image_paths)}, generated={len(generated_paths)}"
+        )
+
+    logger.success(
+        f"Generated {len(valid_image_paths)} validated images for task {task_id}"
+    )
+    return valid_image_paths

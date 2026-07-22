@@ -6,6 +6,7 @@ import gc
 import shutil
 import subprocess
 import json
+import tempfile
 from typing import List
 from loguru import logger
 from moviepy import (
@@ -31,6 +32,17 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services.utils import video_effects
+from app.services.media_utils import (
+    MediaProcessingError,
+    create_temporary_output_path,
+    probe_duration,
+    publish_output,
+    remove_file_safely,
+    run_media_command,
+    validate_audio_file,
+    validate_image_file,
+    validate_video_file,
+)
 from app.utils import utils
 
 class SubClippedVideoClip:
@@ -147,159 +159,167 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
-    """使用 ffmpeg 命令行工具合成视频，提高效率"""
-    if type(video_concat_mode) is str:
-        video_concat_mode = VideoConcatMode(video_concat_mode)
-    if type(video_transition_mode) is str:
-        video_transition_mode = VideoTransitionMode(video_transition_mode)
-    if video_transition_mode is None:
-        video_transition_mode = VideoTransitionMode.none
+    """Combine homogeneous local materials with narration using strict checks.
 
-    # 获取音频时长
-    try:
-        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', audio_file]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        info = json.loads(result.stdout)
-        audio_duration = float(info['streams'][0]['duration'])
-        logger.info(f"audio duration: {audio_duration} seconds")
-    except Exception as e:
-        logger.warning(f"无法获取音频时长: {str(e)}")
-        audio_duration = 30
+    The previous implementation returned the requested path even after ffmpeg
+    failed and silently ignored video inputs whenever one image was present.
+    This implementation either publishes a validated result or raises an error.
+    """
+    del video_concat_mode, video_transition_mode
 
-    output_dir = os.path.dirname(combined_video_path)
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
+    thread_count = max(1, int(threads))
+    audio_duration = validate_audio_file(audio_file)
 
-    # 过滤有效文件
-    valid_paths = [p for p in video_paths if os.path.exists(p)]
+    valid_paths = [path for path in video_paths if path and os.path.isfile(path)]
     if not valid_paths:
-        logger.error("没有可用的视频/图片文件")
-        return combined_video_path
+        raise MediaProcessingError("no valid image or video materials were supplied")
 
-    # 如果只有图片素材，将所有图片按顺序组合成视频
-    image_paths = [p for p in valid_paths if is_image_file(p)]
-    if image_paths:
-        logger.info(f"将 {len(image_paths)} 张图片按顺序组合成视频")
-        
-        # 计算每张图片的显示时长（平均分配音频时长）
-        images_count = len(image_paths)
-        image_duration = audio_duration / images_count
-        logger.info(f"音频时长: {audio_duration:.2f}s, 图片数量: {images_count}, 每张图片显示: {image_duration:.2f}s")
-        
-        # 创建图片列表文件（用于 ffmpeg concat）
-        image_list_file = os.path.join(output_dir, "image_list.txt")
-        with open(image_list_file, "w") as f:
-            for img_path in image_paths:
-                f.write(f"file '{os.path.abspath(img_path)}'\n")
-                f.write(f"duration {image_duration:.2f}\n")
-        
-        # 使用 ffmpeg concat 滤镜将图片按顺序组合
-        temp_video = os.path.join(output_dir, "temp_image_video.mp4")
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat', '-safe', '0',
-            '-i', image_list_file,
-            '-c:v', 'libx264',
-            '-pix_fmt', 'yuv420p',
-            '-vf', f'scale={video_width}:{video_height}',
-            '-r', '30',
-            '-threads', str(threads),
-            temp_video
-        ]
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"图片组合失败: {result.stderr}")
-                return combined_video_path
-        except Exception as e:
-            logger.error(f"图片组合异常: {str(e)}")
-            return combined_video_path
-        
-        # 添加音频
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', temp_video,
-            '-i', audio_file,
-            '-c:v', 'libx264',
-            '-pix_fmt', 'yuv420p',
-            '-shortest',
-            '-threads', str(threads),
-            combined_video_path
-        ]
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info(f"视频合成完成: {combined_video_path}")
+    image_paths = [path for path in valid_paths if is_image_file(path)]
+    video_only_paths = [path for path in valid_paths if not is_image_file(path)]
+    if image_paths and video_only_paths:
+        raise MediaProcessingError(
+            "mixed image and video materials are not supported in one render"
+        )
+
+    output_dir = os.path.dirname(combined_video_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    temporary_output = create_temporary_output_path(combined_video_path)
+
+    scale_filter = (
+        f"scale={video_width}:{video_height}:force_original_aspect_ratio=increase,"
+        f"crop={video_width}:{video_height},setsar=1"
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="render-", dir=output_dir) as work_dir:
+            normalized_segments = []
+            if image_paths:
+                image_duration = audio_duration / len(image_paths)
+                for index, image_path in enumerate(image_paths):
+                    validate_image_file(image_path)
+                    segment_path = os.path.join(work_dir, f"image-{index:04d}.mp4")
+                    run_media_command(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-loop",
+                            "1",
+                            "-i",
+                            image_path,
+                            "-an",
+                            "-vf",
+                            scale_filter,
+                            "-t",
+                            f"{image_duration:.6f}",
+                            "-r",
+                            str(fps),
+                            "-c:v",
+                            video_codec,
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-threads",
+                            str(thread_count),
+                            segment_path,
+                        ],
+                        stage=f"render image segment {index + 1}",
+                    )
+                    validate_video_file(segment_path, require_audio=False)
+                    normalized_segments.append(segment_path)
             else:
-                logger.error(f"添加音频失败: {result.stderr}")
-        except Exception as e:
-            logger.error(f"添加音频异常: {str(e)}")
-        
-        # 清理临时文件
-        if os.path.exists(temp_video):
-            os.remove(temp_video)
-        if os.path.exists(image_list_file):
-            os.remove(image_list_file)
-        
-        return combined_video_path
+                if max_clip_duration <= 0:
+                    raise MediaProcessingError("max_clip_duration must be positive")
+                for index, video_path in enumerate(video_only_paths):
+                    segment_path = os.path.join(work_dir, f"video-{index:04d}.mp4")
+                    run_media_command(
+                        [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            video_path,
+                            "-an",
+                            "-vf",
+                            scale_filter,
+                            "-t",
+                            str(max_clip_duration),
+                            "-r",
+                            str(fps),
+                            "-c:v",
+                            video_codec,
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-threads",
+                            str(thread_count),
+                            segment_path,
+                        ],
+                        stage=f"normalize video segment {index + 1}",
+                    )
+                    validate_video_file(segment_path, require_audio=False)
+                    normalized_segments.append(segment_path)
 
-    # 如果有视频文件，使用视频处理逻辑
-    # 创建视频列表文件
-    video_list_file = os.path.join(output_dir, "video_list.txt")
-    with open(video_list_file, "w") as f:
-        for video_path in valid_paths:
-            f.write(f"file '{os.path.abspath(video_path)}'\n")
+            if not normalized_segments:
+                raise MediaProcessingError("material normalization produced no segments")
 
-    # 使用 ffmpeg concat 滤镜合并视频
-    temp_concat = os.path.join(output_dir, "temp_concat.mp4")
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 'concat', '-safe', '0',
-        '-i', video_list_file,
-        '-c', 'copy',
-        '-threads', str(threads),
-        temp_concat
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"视频合并失败: {result.stderr}")
-            return combined_video_path
-    except Exception as e:
-        logger.error(f"视频合并异常: {str(e)}")
-        return combined_video_path
+            concat_list_path = os.path.join(work_dir, "segments.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as concat_file:
+                for segment_path in normalized_segments:
+                    concat_file.write(f"file '{segment_path}'\n")
 
-    # 添加音频并调整尺寸
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', temp_concat,
-        '-i', audio_file,
-        '-c:v', 'libx264',
-        '-pix_fmt', 'yuv420p',
-        '-vf', f'scale={video_width}:{video_height}',
-        '-shortest',
-        '-threads', str(threads),
-        combined_video_path
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info(f"视频合成完成: {combined_video_path}")
-        else:
-            logger.error(f"视频合成失败: {result.stderr}")
-    except Exception as e:
-        logger.error(f"视频合成异常: {str(e)}")
+            silent_video_path = os.path.join(work_dir, "silent-video.mp4")
+            run_media_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    concat_list_path,
+                    "-c",
+                    "copy",
+                    silent_video_path,
+                ],
+                stage="concatenate normalized video segments",
+            )
+            validate_video_file(silent_video_path, require_audio=False)
 
-    # 清理临时文件
-    if os.path.exists(temp_concat):
-        os.remove(temp_concat)
-    if os.path.exists(video_list_file):
-        os.remove(video_list_file)
+            run_media_command(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-stream_loop",
+                    "-1",
+                    "-i",
+                    silent_video_path,
+                    "-i",
+                    audio_file,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    audio_codec,
+                    "-t",
+                    f"{audio_duration:.6f}",
+                    "-shortest",
+                    temporary_output,
+                ],
+                stage="attach narration audio",
+            )
+            validate_video_file(
+                temporary_output,
+                expected_duration=audio_duration,
+                require_audio=True,
+            )
+            publish_output(temporary_output, combined_video_path)
+    finally:
+        remove_file_safely(temporary_output)
 
+    logger.info(f"video composition completed: {combined_video_path}")
     return combined_video_path
 
 
@@ -444,7 +464,7 @@ def generate_video(
             font_size=params.font_size,
         )
 
-    if subtitle_path and os.path.exists(subtitle_path):
+    if params.subtitle_enabled and subtitle_path and os.path.exists(subtitle_path):
         sub = SubtitlesClip(
             subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
         )
@@ -468,17 +488,28 @@ def generate_video(
         except Exception as e:
             logger.error(f"failed to add bgm: {str(e)}")
 
-    video_clip = video_clip.with_audio(audio_clip)
-    video_clip.write_videofile(
-        output_file,
-        audio_codec=audio_codec,
-        temp_audiofile_path=output_dir,
-        threads=params.n_threads or 2,
-        logger=None,
-        fps=fps,
-    )
-    video_clip.close()
-    del video_clip
+    expected_duration = validate_audio_file(audio_path)
+    temporary_output = create_temporary_output_path(output_file)
+    try:
+        video_clip = video_clip.with_audio(audio_clip)
+        video_clip.write_videofile(
+            temporary_output,
+            audio_codec=audio_codec,
+            temp_audiofile_path=output_dir,
+            threads=params.n_threads or 2,
+            logger=None,
+            fps=fps,
+        )
+        validate_video_file(
+            temporary_output,
+            expected_duration=expected_duration,
+            require_audio=True,
+        )
+        publish_output(temporary_output, output_file)
+    finally:
+        remove_file_safely(temporary_output)
+        close_clip(video_clip)
+        close_clip(audio_clip)
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):

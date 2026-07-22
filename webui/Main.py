@@ -25,6 +25,16 @@ from app.models.schema import PodcastScript, VideoAspect
 from app.services import llm
 from app.services import podcast_audio
 from app.services.image_generator import generate_sentence_image
+from app.services.media_utils import (
+    MediaProcessingError,
+    create_temporary_output_path,
+    publish_output,
+    remove_file_safely,
+    run_media_command,
+    validate_audio_file,
+    validate_image_file,
+    validate_video_file,
+)
 from app.utils import utils
 from app.services.video import get_bgm_file
 from app.services.voice import get_siliconflow_voices, siliconflow_tts, MiniMax_tts, get_audio_duration
@@ -33,25 +43,9 @@ from app.services.voice import SubMaker
 
 def _get_audio_file_duration(audio_file: str) -> float:
     """读取实际 MP3 时长，避免用字幕/文字长度估算导致画面错位。"""
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        audio_file,
-    ]
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return max(0.0, float(completed.stdout.strip()))
-    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
+        return validate_audio_file(audio_file)
+    except MediaProcessingError as error:
         logger.warning(f"Unable to probe audio duration for {audio_file}: {error}")
         return 0.0
 
@@ -197,11 +191,38 @@ if "error_message" not in st.session_state:
 
 # ============ 核心功能函数 ============
 
+def _load_fallback_font(font_size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load a readable cross-platform font before using Pillow's tiny bitmap font."""
+    font_candidates = [
+        os.path.join(utils.font_dir(), "MicrosoftYaHeiBold.ttc"),
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "arial.ttf",
+    ]
+    for font_path in font_candidates:
+        try:
+            return ImageFont.truetype(font_path, font_size)
+        except OSError:
+            continue
+    logger.warning("No scalable fallback font found; using Pillow default font")
+    return ImageFont.load_default()
+
+
+def _is_valid_generated_image(image_path: str) -> bool:
+    try:
+        validate_image_file(image_path)
+        return True
+    except MediaProcessingError as error:
+        logger.warning(f"Generated image failed validation: {error}")
+        return False
+
 def generate_fallback_image(sentence: str, keywords: list, output_path: str, speaker: str = "Speaker") -> str:
     """
     使用 PIL 生成备选图片（当 AI 图片生成失败时）
     创建一个带文案和关键词的教育风格图片
     """
+    temporary_output_path = ""
     try:
         # 9:16 竖版尺寸 (1080x1920)
         width, height = 1080, 1920
@@ -210,17 +231,9 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
         img = Image.new('RGB', (width, height), color='#F5F5DC')  # 米黄色背景
         draw = ImageDraw.Draw(img)
         
-        # 尝试加载字体
-        try:
-            # Windows 系统字体
-            title_font = ImageFont.truetype("arial.ttf", 48)
-            sentence_font = ImageFont.truetype("arial.ttf", 36)
-            keyword_font = ImageFont.truetype("arial.ttf", 28)
-        except:
-            # 使用默认字体
-            title_font = ImageFont.load_default()
-            sentence_font = ImageFont.load_default()
-            keyword_font = ImageFont.load_default()
+        title_font = _load_fallback_font(64)
+        sentence_font = _load_fallback_font(52)
+        keyword_font = _load_fallback_font(40)
         
         # 绘制顶部标题区域
         draw.rectangle([0, 0, width, 150], fill='#4A90D9')  # 蓝色标题栏
@@ -233,10 +246,10 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
         
         # 绘制句子（居中，自动换行）
         y_position = 300
-        wrapped_lines = textwrap.wrap(sentence, width=40)
+        wrapped_lines = textwrap.wrap(sentence, width=34)
         for line in wrapped_lines:
             draw.text((width//2, y_position), line, font=sentence_font, fill='#333333', anchor='mm')
-            y_position += 50
+            y_position += 72
         
         # 绘制关键词区域
         if keywords:
@@ -254,7 +267,10 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
                 y_position += 50
         
         # 保存图片
-        img.save(output_path, 'PNG')
+        temporary_output_path = create_temporary_output_path(output_path)
+        img.save(temporary_output_path, 'PNG')
+        validate_image_file(temporary_output_path)
+        publish_output(temporary_output_path, output_path)
         logger.info(f"   PIL 备选图片生成成功: {output_path}")
         return output_path
         
@@ -265,7 +281,10 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
         draw = ImageDraw.Draw(img)
         draw.text((540, 960), sentence[:50], fill='black', anchor='mm')
         img.save(output_path, 'PNG')
+        validate_image_file(output_path)
         return output_path
+    finally:
+        remove_file_safely(temporary_output_path)
 
 
 def generate_podcast_video(article_text: str, output_dir: str, 
@@ -406,7 +425,7 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 )
                 
                 # 如果 AI 生成失败，使用 PIL 备选图片
-                if result and os.path.exists(result):
+                if result and _is_valid_generated_image(result):
                     image_paths.append(result)
                     logger.info(f"   图片 {image_index}: AI生成成功, 关键词={keywords} ✅")
                 else:
@@ -436,7 +455,7 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 )
                 
                 # 如果 AI 生成失败，使用 PIL 备选图片
-                if result and os.path.exists(result):
+                if result and _is_valid_generated_image(result):
                     image_paths.append(result)
                     logger.info(f"   图片 {image_index}: AI生成成功, 关键词={keywords} ✅")
                 else:
@@ -458,11 +477,14 @@ def generate_podcast_video(article_text: str, output_dir: str,
         # 步骤5: 合成视频
         st.info("🎬 正在合成视频...")
         
-        # 匹配图片和音频
+        # Do not silently truncate or shift artifacts. A mismatch means an
+        # upstream utterance failed and positional zip() would produce wrong
+        # image/audio pairings.
         if len(image_paths) != len(audio_segments):
-            count = min(len(image_paths), len(audio_segments))
-            image_paths = image_paths[:count]
-            audio_segments = audio_segments[:count]
+            raise RuntimeError(
+                "图片与音频片段数量不一致: "
+                f"images={len(image_paths)}, audio={len(audio_segments)}"
+            )
         
         # 创建视频片段
         video_segments = []
@@ -471,25 +493,43 @@ def generate_podcast_video(article_text: str, output_dir: str,
         
         for i, (image_path, (audio_file, audio_duration, _)) in enumerate(zip(image_paths, audio_segments)):
             segment_video = os.path.join(output_dir, f"segment_{i}.mp4")
+            validate_image_file(image_path)
+            validate_audio_file(audio_file)
             
             cmd = [
                 'ffmpeg', '-y',
                 '-loop', '1',
                 '-i', image_path,
                 '-i', audio_file,
+                '-map', '0:v:0',
+                '-map', '1:a:0',
                 '-c:v', 'libx264',
+                '-c:a', 'aac',
                 '-pix_fmt', 'yuv420p',
-                '-vf', f'scale={video_width}:{video_height}',
+                '-vf', (
+                    f'scale={video_width}:{video_height}:'
+                    'force_original_aspect_ratio=increase,'
+                    f'crop={video_width}:{video_height},setsar=1'
+                ),
                 '-t', str(audio_duration),
                 '-shortest',
                 '-threads', '2',
                 segment_video
             ]
             
-            subprocess.run(cmd, capture_output=True, text=True)
-            if os.path.exists(segment_video):
-                video_segments.append(segment_video)
-                logger.info(f"   片段 {i}: {audio_duration:.2f}秒 ✅")
+            run_media_command(cmd, stage=f"生成视频片段 {i + 1}")
+            validate_video_file(
+                segment_video,
+                expected_duration=audio_duration,
+                require_audio=True,
+            )
+            video_segments.append(segment_video)
+            logger.info(f"   片段 {i}: {audio_duration:.2f}秒 ✅")
+
+        if len(video_segments) != len(audio_segments):
+            raise RuntimeError(
+                f"视频片段生成不完整: {len(video_segments)}/{len(audio_segments)}"
+            )
         
         # 拼接视频片段
         video_list_file = os.path.join(output_dir, "video_list.txt")
@@ -497,24 +537,32 @@ def generate_podcast_video(article_text: str, output_dir: str,
             for video_path in video_segments:
                 f.write(f"file '{os.path.abspath(video_path)}'\n")
         
+        expected_total_duration = sum(segment[1] for segment in audio_segments)
         final_video = os.path.join(output_dir, "final_video_no_bgm.mp4")
+        temporary_final_video = create_temporary_output_path(final_video)
         cmd = [
             'ffmpeg', '-y',
             '-f', 'concat', '-safe', '0',
             '-i', video_list_file,
             '-c', 'copy',
-            final_video
+            temporary_final_video
         ]
-        
-        subprocess.run(cmd, capture_output=True, text=True)
-        
-        # 清理临时文件
+
         try:
-            os.remove(video_list_file)
-            for seg in video_segments:
-                os.remove(seg)
-        except:
-            pass
+            run_media_command(cmd, stage="拼接视频片段")
+            validate_video_file(
+                temporary_final_video,
+                expected_duration=expected_total_duration,
+                require_audio=True,
+            )
+            publish_output(temporary_final_video, final_video)
+        finally:
+            remove_file_safely(temporary_final_video)
+
+        # Only remove diagnostics after a validated final file exists.
+        remove_file_safely(video_list_file)
+        for segment_path in video_segments:
+            remove_file_safely(segment_path)
         
         # 步骤6: 混合背景音乐
         if bgm_type and bgm_type != "none":
@@ -533,8 +581,11 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 # 否则音量滑块无效（旧行为是死代码）。
                 filter_complex = (
                     f"[1:a]volume={bgm_volume}[bg];"
-                    f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                    f"[0:a][bg]amix=inputs=2:duration=first:"
+                    "dropout_transition=0:normalize=0[aout]"
                 )
+
+                temporary_bgm_video = create_temporary_output_path(final_video_with_bgm)
 
                 cmd = [
                     'ffmpeg', '-y',
@@ -549,17 +600,21 @@ def generate_podcast_video(article_text: str, output_dir: str,
                     '-b:a', '192k',
                     '-shortest',
                     '-threads', '2',
-                    final_video_with_bgm
+                    temporary_bgm_video
                 ]
 
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-
-                if os.path.exists(final_video_with_bgm) and os.path.getsize(final_video_with_bgm) > 0:
+                try:
+                    run_media_command(cmd, stage="混合背景音乐")
+                    validate_video_file(
+                        temporary_bgm_video,
+                        expected_duration=expected_total_duration,
+                        require_audio=True,
+                    )
+                    publish_output(temporary_bgm_video, final_video_with_bgm)
                     final_video = final_video_with_bgm
                     logger.info(f"   ✅ 背景音乐已添加 (音量: {bgm_volume})")
-                else:
-                    logger.error(f"   ⚠️ 背景音乐混合失败: {proc.stderr[-300:] if proc.stderr else ''}")
-                    st.error("背景音乐混合失败，已使用无音乐版本")
+                finally:
+                    remove_file_safely(temporary_bgm_video)
             else:
                 logger.warning(f"   ⚠️ 未找到背景音乐文件")
                 st.warning("未找到背景音乐文件（检查 resource/songs 是否有 mp3），已使用无音乐版本")
@@ -567,17 +622,42 @@ def generate_podcast_video(article_text: str, output_dir: str,
                 final_video_with_bgm = os.path.join(output_dir, "final_video.mp4")
                 if os.path.exists(final_video):
                     import shutil
-                    shutil.copy2(final_video, final_video_with_bgm)
+                    temporary_copy = create_temporary_output_path(final_video_with_bgm)
+                    try:
+                        shutil.copy2(final_video, temporary_copy)
+                        validate_video_file(
+                            temporary_copy,
+                            expected_duration=expected_total_duration,
+                            require_audio=True,
+                        )
+                        publish_output(temporary_copy, final_video_with_bgm)
+                    finally:
+                        remove_file_safely(temporary_copy)
                     final_video = final_video_with_bgm
         else:
             # 不需要背景音乐，直接重命名为最终文件名
             final_video_with_bgm = os.path.join(output_dir, "final_video.mp4")
             if os.path.exists(final_video):
                 import shutil
-                shutil.copy2(final_video, final_video_with_bgm)
+                temporary_copy = create_temporary_output_path(final_video_with_bgm)
+                try:
+                    shutil.copy2(final_video, temporary_copy)
+                    validate_video_file(
+                        temporary_copy,
+                        expected_duration=expected_total_duration,
+                        require_audio=True,
+                    )
+                    publish_output(temporary_copy, final_video_with_bgm)
+                finally:
+                    remove_file_safely(temporary_copy)
                 final_video = final_video_with_bgm
         
         if os.path.exists(final_video):
+            validate_video_file(
+                final_video,
+                expected_duration=expected_total_duration,
+                require_audio=True,
+            )
             results["video_path"] = final_video
             logger.info(f"✅ 视频生成成功: {final_video}")
             results["success"] = True

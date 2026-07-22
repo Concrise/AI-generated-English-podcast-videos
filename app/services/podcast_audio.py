@@ -1,10 +1,18 @@
 import asyncio
 import os
-import subprocess
+import shutil
 from typing import List, Optional, Tuple
 from uuid import uuid4
 from loguru import logger
 from app.models.schema import PodcastScript
+from app.services.media_utils import (
+    MediaProcessingError,
+    create_temporary_output_path,
+    publish_output,
+    remove_file_safely,
+    run_media_command,
+    validate_audio_file,
+)
 from app.services.voice import tts, get_audio_duration
 from app.utils import utils
 
@@ -61,6 +69,7 @@ class PodcastAudioGenerator:
                     voice_rate=voice_rate,
                     voice_volume=voice_volume
                 )
+                temp_audio_files.append(speaker1_audio)
 
                 # 生成说话人2的音频
                 speaker2_audio = await self._generate_speaker_audio(
@@ -70,6 +79,12 @@ class PodcastAudioGenerator:
                     voice_rate=voice_rate,
                     voice_volume=voice_volume
                 )
+                temp_audio_files.append(speaker2_audio)
+
+                if dialogue.speaker_1.strip() and not speaker1_audio:
+                    raise RuntimeError(f"第 {i + 1} 轮 Speaker 1 音频生成失败")
+                if dialogue.speaker_2.strip() and not speaker2_audio:
+                    raise RuntimeError(f"第 {i + 1} 轮 Speaker 2 音频生成失败")
 
                 # 合并当前轮对话的音频
                 dialogue_audio = self._merge_dialogue_audio(speaker1_audio, speaker2_audio)
@@ -77,18 +92,19 @@ class PodcastAudioGenerator:
 
             # 合并所有对话音频
             final_audio_path = self._concatenate_all_audio(temp_audio_files)
+            temp_audio_files.append(final_audio_path)
 
-            # 如果合并成功且文件存在，复制到目标路径
-            if final_audio_path and os.path.exists(final_audio_path):
-                import shutil
-                shutil.copy2(final_audio_path, output_path)
-            elif temp_audio_files and os.path.exists(temp_audio_files[0]):
-                # 回退方案：使用第一个音频文件
-                import shutil
-                shutil.copy2(temp_audio_files[0], output_path)
+            if not final_audio_path or not os.path.exists(final_audio_path):
+                raise RuntimeError("播客音频拼接未生成有效输出")
+            validate_audio_file(final_audio_path)
 
-            # 获取音频时长
-            audio_duration = self._get_audio_file_duration(output_path)
+            temporary_output_path = create_temporary_output_path(output_path)
+            try:
+                shutil.copy2(final_audio_path, temporary_output_path)
+                audio_duration = validate_audio_file(temporary_output_path)
+                publish_output(temporary_output_path, output_path)
+            finally:
+                remove_file_safely(temporary_output_path)
 
             logger.success(f"播客音频生成完成: {output_path}, 时长: {audio_duration:.2f}秒")
             return output_path, audio_duration
@@ -141,6 +157,7 @@ class PodcastAudioGenerator:
             )
 
             if sub_maker and os.path.exists(output_file):
+                validate_audio_file(output_file)
                 logger.info(f"成功生成音频: {output_file}")
                 return output_file
             else:
@@ -159,6 +176,9 @@ class PodcastAudioGenerator:
         if speaker2_audio and os.path.exists(speaker2_audio):
             inputs.append(speaker2_audio)
 
+        if not inputs:
+            raise RuntimeError("当前对话没有可用音频")
+
         return self._concat_with_silence(
             inputs,
             os.path.join(self.temp_dir, f"dialogue_{uuid4().hex}.mp3"),
@@ -167,7 +187,19 @@ class PodcastAudioGenerator:
 
     def _concatenate_all_audio(self, audio_files: List[str]) -> str:
         """拼接所有音频文件，并在每轮对话之间插入真实静音片段。"""
-        valid_files = [f for f in audio_files if f and os.path.exists(f)]
+        valid_files = []
+        seen_paths = set()
+        for audio_file in audio_files:
+            if not audio_file or audio_file in seen_paths or not os.path.exists(audio_file):
+                continue
+            seen_paths.add(audio_file)
+            # Only dialogue outputs are concatenated here. Speaker files are kept
+            # in the cleanup list but are not part of the final sequence.
+            if os.path.basename(audio_file).startswith("dialogue_"):
+                valid_files.append(audio_file)
+
+        if not valid_files:
+            raise RuntimeError("没有可用于最终拼接的对话音频")
         return self._concat_with_silence(
             valid_files,
             os.path.join(self.temp_dir, f"final_audio_{uuid4().hex}.mp3"),
@@ -176,8 +208,9 @@ class PodcastAudioGenerator:
 
     def _concat_with_silence(self, audio_files: List[str], output_file: str, silence_ms: int) -> str:
         if not audio_files:
-            return ""
+            raise RuntimeError("音频拼接输入为空")
         if len(audio_files) == 1:
+            validate_audio_file(audio_files[0])
             return audio_files[0]
 
         silence_file = os.path.join(self.temp_dir, f"silence_{silence_ms}_{uuid4().hex}.mp3")
@@ -194,25 +227,17 @@ class PodcastAudioGenerator:
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", list_file, "-c:a", "libmp3lame", output_file,
             ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            run_media_command(cmd, stage="concatenate podcast audio", timeout_seconds=180)
+            validate_audio_file(output_file)
             logger.info(f"音频拼接完成: {output_file}")
             return output_file
-        except subprocess.CalledProcessError as e:
-            logger.error(f"ffmpeg音频拼接失败: {e.stderr}")
-            return audio_files[0]
-        except FileNotFoundError:
-            logger.warning("ffmpeg未找到，返回第一个音频文件")
-            return audio_files[0]
-        except Exception as e:
-            logger.error(f"音频拼接失败: {str(e)}")
-            return audio_files[0]
+        except MediaProcessingError:
+            raise
+        except Exception as error:
+            raise RuntimeError(f"音频拼接失败: {error}") from error
         finally:
             for temp_file in [silence_file, list_file]:
-                try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                except Exception:
-                    pass
+                remove_file_safely(temp_file)
 
     def _create_silence_audio(self, output_file: str, duration_ms: int):
         duration_seconds = max(duration_ms, 0) / 1000
@@ -221,7 +246,8 @@ class PodcastAudioGenerator:
             "anullsrc=r=44100:cl=stereo",
             "-t", str(duration_seconds), "-q:a", "9", "-acodec", "libmp3lame", output_file,
         ]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        run_media_command(cmd, stage="create silence audio", timeout_seconds=30)
+        validate_audio_file(output_file)
 
     def _get_audio_file_duration(self, audio_file: str) -> float:
         """
@@ -233,30 +259,11 @@ class PodcastAudioGenerator:
         Returns:
             音频时长（秒）
         """
-        if not audio_file or not os.path.exists(audio_file):
-            return 0.0
-
         try:
-            # 使用ffprobe获取音频时长
-            cmd = [
-                'ffprobe', '-v', 'quiet', '-show_entries',
-                'format=duration', '-of', 'csv=p=0', audio_file
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            duration = float(result.stdout.strip())
-            return duration
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-            # 如果ffprobe不可用，使用moviepy
-            try:
-                from moviepy import AudioFileClip
-                audio_clip = AudioFileClip(audio_file)
-                duration = audio_clip.duration
-                audio_clip.close()
-                return duration
-            except Exception:
-                # 如果都不可用，返回估算值
-                logger.warning(f"无法获取音频时长: {audio_file}")
-                return 0.0
+            return validate_audio_file(audio_file)
+        except MediaProcessingError as error:
+            logger.warning(f"无法获取音频时长: {error}")
+            return 0.0
 
     def _cleanup_temp_files(self, temp_files: List[str]):
         """
@@ -266,12 +273,9 @@ class PodcastAudioGenerator:
             temp_files: 临时文件路径列表
         """
         for temp_file in temp_files:
-            try:
-                if temp_file and os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    logger.debug(f"已删除临时文件: {temp_file}")
-            except Exception as e:
-                logger.warning(f"删除临时文件失败 {temp_file}: {str(e)}")
+            if temp_file and os.path.exists(temp_file):
+                remove_file_safely(temp_file)
+                logger.debug(f"已删除临时文件: {temp_file}")
 
     async def generate_single_speaker_audio(
         self,

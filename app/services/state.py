@@ -1,4 +1,6 @@
 import ast
+import threading
+import time
 from abc import ABC, abstractmethod
 
 from app.config import config
@@ -24,11 +26,17 @@ class BaseState(ABC):
 class MemoryState(BaseState):
     def __init__(self):
         self._tasks = {}
+        self._lock = threading.RLock()
 
     def get_all_tasks(self, page: int, page_size: int):
         start = (page - 1) * page_size
         end = start + page_size
-        tasks = list(self._tasks.values())
+        with self._lock:
+            tasks = [dict(task) for task in self._tasks.values()]
+        tasks.sort(
+            key=lambda task: (task.get("created_at", 0), task.get("task_id", "")),
+            reverse=True,
+        )
         total = len(tasks)
         return tasks[start:end], total
 
@@ -39,52 +47,65 @@ class MemoryState(BaseState):
         progress: int = 0,
         **kwargs,
     ):
-        progress = int(progress)
-        if progress > 100:
-            progress = 100
-
-        self._tasks[task_id] = {
-            "task_id": task_id,
-            "state": state,
-            "progress": progress,
-            **kwargs,
-        }
+        progress = max(0, min(100, int(progress)))
+        with self._lock:
+            existing = self._tasks.get(task_id, {})
+            created_at = existing.get("created_at", time.time())
+            self._tasks[task_id] = {
+                **existing,
+                "task_id": task_id,
+                "state": state,
+                "progress": progress,
+                "created_at": created_at,
+                "updated_at": time.time(),
+                **kwargs,
+            }
 
     def get_task(self, task_id: str):
-        return self._tasks.get(task_id, None)
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return dict(task) if task else None
 
     def delete_task(self, task_id: str):
-        if task_id in self._tasks:
-            del self._tasks[task_id]
+        with self._lock:
+            self._tasks.pop(task_id, None)
 
 
 # Redis state management
 class RedisState(BaseState):
+    TASK_KEY_PREFIX = "task:state:"
+    TASK_INDEX_KEY = "task:index"
+
     def __init__(self, host="localhost", port=6379, db=0, password=None):
         import redis
 
         self._redis = redis.StrictRedis(host=host, port=port, db=db, password=password)
 
+    @classmethod
+    def _task_key(cls, task_id: str) -> str:
+        return f"{cls.TASK_KEY_PREFIX}{task_id}"
+
     def get_all_tasks(self, page: int, page_size: int):
         start = (page - 1) * page_size
-        end = start + page_size
+        end = start + page_size - 1
+        total = self._redis.zcard(self.TASK_INDEX_KEY)
+        task_ids = self._redis.zrevrange(self.TASK_INDEX_KEY, start, end)
+        pipeline = self._redis.pipeline(transaction=False)
+        for task_id in task_ids:
+            decoded_task_id = task_id.decode("utf-8")
+            pipeline.hgetall(self._task_key(decoded_task_id))
+        task_rows = pipeline.execute() if task_ids else []
+
         tasks = []
-        cursor = 0
-        total = 0
-        while True:
-            cursor, keys = self._redis.scan(cursor, count=page_size)
-            total += len(keys)
-            if total > start:
-                for key in keys[max(0, start - total):end - total]:
-                    task_data = self._redis.hgetall(key)
-                    task = {
-                        k.decode("utf-8"): self._convert_to_original_type(v) for k, v in task_data.items()
-                    }
-                    tasks.append(task)
-                    if len(tasks) >= page_size:
-                        break
-            if cursor == 0 or len(tasks) >= page_size:
-                break
+        for task_data in task_rows:
+            if not task_data:
+                continue
+            tasks.append(
+                {
+                    key.decode("utf-8"): self._convert_to_original_type(value)
+                    for key, value in task_data.items()
+                }
+            )
         return tasks, total
 
     def update_task(
@@ -94,22 +115,31 @@ class RedisState(BaseState):
         progress: int = 0,
         **kwargs,
     ):
-        progress = int(progress)
-        if progress > 100:
-            progress = 100
+        progress = max(0, min(100, int(progress)))
+        task_key = self._task_key(task_id)
+        existing_created_at = self._redis.hget(task_key, "created_at")
+        created_at = (
+            float(existing_created_at.decode("utf-8"))
+            if existing_created_at
+            else time.time()
+        )
 
         fields = {
             "task_id": task_id,
             "state": state,
             "progress": progress,
+            "created_at": created_at,
+            "updated_at": time.time(),
             **kwargs,
         }
-
-        for field, value in fields.items():
-            self._redis.hset(task_id, field, str(value))
+        encoded_fields = {field: str(value) for field, value in fields.items()}
+        pipeline = self._redis.pipeline(transaction=True)
+        pipeline.hset(task_key, mapping=encoded_fields)
+        pipeline.zadd(self.TASK_INDEX_KEY, {task_id: created_at})
+        pipeline.execute()
 
     def get_task(self, task_id: str):
-        task_data = self._redis.hgetall(task_id)
+        task_data = self._redis.hgetall(self._task_key(task_id))
         if not task_data:
             return None
 
@@ -120,7 +150,10 @@ class RedisState(BaseState):
         return task
 
     def delete_task(self, task_id: str):
-        self._redis.delete(task_id)
+        pipeline = self._redis.pipeline(transaction=True)
+        pipeline.delete(self._task_key(task_id))
+        pipeline.zrem(self.TASK_INDEX_KEY, task_id)
+        pipeline.execute()
 
     @staticmethod
     def _convert_to_original_type(value):
