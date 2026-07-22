@@ -1094,6 +1094,48 @@ def is_MiniMax_voice(voice_name: str):
     return voice_name.startswith("MiniMax:") or voice_name.startswith("MiniMax_")
 
 
+def is_openai_voice(voice_name: str):
+    """检查是否是 OpenAI / Gemini 兼容音色前缀"""
+    return (
+        voice_name.startswith("openai:")
+        or voice_name.startswith("openai_")
+        or voice_name.startswith("gemini:")
+        or voice_name.startswith("gemini_")
+    )
+
+
+# OpenAI / Gemini 常见音色 id（无前缀时也可识别，避免误伤 Azure Neural 名）
+_OPENAI_BUILTIN_VOICES = {
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    # Gemini prebuilt voices
+    "kore",
+    "puck",
+    "charon",
+    "fenrir",
+    "aoede",
+}
+
+
+def is_openai_builtin_voice(voice_name: str) -> bool:
+    """是否为 OpenAI/Gemini 内置音色名（不含前缀）。"""
+    raw = (voice_name or "").strip().lower()
+    if not raw or ":" in raw or raw.endswith("-v2"):
+        return False
+    # Azure 风格 en-US-AriaNeural 等不应命中
+    if "-" in raw and any(part.isupper() for part in (voice_name or "").split("-")):
+        return False
+    return raw in _OPENAI_BUILTIN_VOICES
+
+
 async def tts(
     text: str,
     voice_name: str,
@@ -1101,11 +1143,41 @@ async def tts(
     voice_file: str,
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
+    # OpenAI / Gemini 兼容：openai:alloy / gemini:Kore / 或纯内置名
+    if is_openai_voice(voice_name) or is_openai_builtin_voice(voice_name):
+        from app.services.openai_compat import is_tts_configured
+
+        if not is_tts_configured():
+            logger.error("TTS voice selected but [tts]/[openai] api_key is empty")
+            return None
+        if is_openai_voice(voice_name):
+            normalized = voice_name
+        else:
+            # 纯音色名：按配置 provider 默认前缀
+            from app.services.openai_compat import get_tts_settings
+
+            provider = get_tts_settings().get("provider") or "openai"
+            normalized = f"{provider}:{voice_name}"
+        return openai_compatible_tts(text, normalized, voice_rate, voice_file)
+
+    # 已配置 Gemini/OpenAI TTS 时，对未识别前缀也优先尝试配置默认 TTS
+    from app.services.openai_compat import is_tts_configured, get_tts_settings
+    if is_tts_configured() and not (
+        is_azure_v2_voice(voice_name)
+        or is_MiniMax_voice(voice_name)
+        or is_siliconflow_voice(voice_name)
+    ):
+        provider = get_tts_settings().get("provider") or "gemini"
+        result = openai_compatible_tts(
+            text, f"{provider}:{voice_name}", voice_rate, voice_file
+        )
+        if result:
+            return result
+
     if is_azure_v2_voice(voice_name):
         return azure_tts_v2(text, voice_name, voice_file)
     elif is_MiniMax_voice(voice_name):
         # MiniMax 声音: MiniMax:model:voice_id
-        # 优先使用 MiniMax，如果 key 不可用则回退到 SiliconFlow
         if config.MiniMax.get("api_key", ""):
             parts = voice_name.split(":")
             model = parts[1] if len(parts) > 1 else "speech-2.6-hd"
@@ -1114,22 +1186,17 @@ async def tts(
             if result:
                 return result
             logger.warning("MiniMax tts failed, trying SiliconFlow fallback")
-        # 回退到 SiliconFlow
         if config.siliconflow.get("api_key", ""):
             return siliconflow_tts(
                 text, "FunAudioLLM/CosyVoice2-0.5B", voice_name.replace("MiniMax:", "siliconflow:"),
                 voice_rate, voice_file, voice_volume
             )
     elif is_siliconflow_voice(voice_name):
-        # 从voice_name中提取模型和声音
-        # 格式: siliconflow:model:voice-Gender
         parts = voice_name.split(":")
         if len(parts) >= 3:
             model = parts[1]
-            # 移除性别后缀，例如 "alex-Male" -> "alex"
             voice_with_gender = parts[2]
             voice = voice_with_gender.split("-")[0]
-            # 构建完整的voice参数，格式为 "model:voice"
             full_voice = f"{model}:{voice}"
             return siliconflow_tts(
                 text, model, full_voice, voice_rate, voice_file, voice_volume
@@ -1138,6 +1205,88 @@ async def tts(
             logger.error(f"Invalid siliconflow voice name format: {voice_name}")
             return None
     return await azure_tts_v1(text, voice_name, voice_rate, voice_file)
+
+
+def openai_compatible_tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+) -> Union[SubMaker, None]:
+    """
+    OpenAI 兼容 /audio/speech。
+    voice_name 支持: openai:alloy / openai:tts-1:nova
+    """
+    from datetime import timedelta
+
+    from app.services.openai_compat import parse_openai_voice_name, text_to_speech
+    from app.utils import utils
+
+    text = text.strip()
+    model_name, voice_id = parse_openai_voice_name(voice_name)
+    ok = text_to_speech(
+        text,
+        voice_file,
+        model=model_name,
+        voice=voice_id,
+        speed=voice_rate,
+    )
+    if not ok:
+        return None
+
+    sub_maker = SubMaker()
+    try:
+        from moviepy import AudioFileClip
+
+        audio_clip = AudioFileClip(voice_file)
+        audio_duration = audio_clip.duration
+        audio_clip.close()
+        audio_duration_100ns = int(audio_duration * 10000000)
+    except Exception:
+        audio_duration_100ns = 10000000
+
+    try:
+        from edge_tts.srt_composer import Subtitle
+
+        sentences = utils.split_string_by_punctuations(text)
+        if sentences:
+            total_chars = sum(len(sentence) for sentence in sentences)
+            char_duration = (
+                audio_duration_100ns / total_chars if total_chars > 0 else 0
+            )
+            current_offset = 0
+            for sentence in sentences:
+                if not sentence.strip():
+                    continue
+                sentence_duration = int(len(sentence) * char_duration)
+                sub_maker.cues.append(
+                    Subtitle(
+                        index=len(sub_maker.cues) + 1,
+                        start=timedelta(microseconds=current_offset / 10),
+                        end=timedelta(
+                            microseconds=(current_offset + sentence_duration) / 10
+                        ),
+                        content=sentence,
+                    )
+                )
+                current_offset += sentence_duration
+        else:
+            sub_maker.cues.append(
+                Subtitle(
+                    index=1,
+                    start=timedelta(microseconds=0),
+                    end=timedelta(microseconds=audio_duration_100ns / 10),
+                    content=text,
+                )
+            )
+    except Exception as error:
+        logger.warning(f"OpenAI-compatible TTS subtitle build failed: {error}")
+        # 兼容旧 SubMaker 结构
+        if hasattr(sub_maker, "subs"):
+            sub_maker.subs = [text]
+            sub_maker.offset = [(0, audio_duration_100ns)]
+
+    return sub_maker
 
 
 def convert_rate_to_percent(rate: float) -> str:

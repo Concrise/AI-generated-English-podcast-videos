@@ -6,11 +6,43 @@ from loguru import logger
 from PIL import Image, ImageDraw, ImageFont
 
 from app.config import config
+from app.services.openai_compat import generate_image as openai_generate_image
+from app.services.openai_compat import is_image_configured
+
+
+def _build_sentence_image_prompt(sentence: str, keywords: list = None) -> str:
+    """将对白转换为以语义为中心的画面提示词，而不是让模型排版教材文字。"""
+    visual_details = ", ".join(
+        str(keyword).strip() for keyword in (keywords or []) if str(keyword).strip()
+    )
+    detail_instruction = (
+        f"Important visual details to include when relevant: {visual_details}."
+        if visual_details
+        else "Identify the most important people, action, setting, and objects from the narration."
+    )
+
+    return f"""
+Create one coherent, literal illustration for this narration:
+"{sentence}"
+
+The image must visually communicate the meaning of the narration. Show a clear
+main subject, a specific action, a believable setting, and the important physical
+objects or concepts mentioned in the narration. {detail_instruction}
+
+Style: polished educational editorial illustration, visually engaging, warm natural
+lighting, clear composition, portrait 9:16. The main subject and action should be
+easy to identify at a glance.
+
+Do not include any written words, letters, subtitles, captions, speech bubbles,
+phonetic symbols, textbook pages, flashcards, logos, or watermarks. Do not make a
+generic English-learning card; make a scene that specifically depicts this narration.
+""".strip()
 
 
 def generate_sentence_image(sentence: str, keywords: list = None, output_path: str = "") -> str:
     """
-    使用 apimart gemini-3 API 根据英文句子生成教育图片
+    根据英文句子生成教育图片。
+    优先 OpenAI 兼容 /images/generations；未配置时回退 apimart。
     
     Args:
         sentence: 英文句子（作为图片内容描述）
@@ -20,37 +52,26 @@ def generate_sentence_image(sentence: str, keywords: list = None, output_path: s
     Returns:
         生成的图片文件路径，失败返回空字符串
     """
-    # 使用 apimart API Key（从配置文件读取）
-    api_key = config.apimart.get("api_key", "")
-    
-    if not api_key:
-        logger.error("apimart API key is not set")
-        return ""
-    
     if not output_path:
         import uuid
         output_path = f"temp/sentence_image_{uuid.uuid4().hex[:8]}.png"
     
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    prompt = _build_sentence_image_prompt(sentence, keywords)
+
+    # 1) OpenAI 兼容第三方优先（[image] / [openai]）
+    if is_image_configured():
+        result_path = openai_generate_image(prompt, output_path)
+        if result_path:
+            return result_path
+        logger.warning("OpenAI-compatible image failed, trying apimart fallback")
+
+    # 2) apimart 回退
+    api_key = config.apimart.get("api_key", "")
     
-    # 构建生图提示语（中小学英语课本风格）
-    prompt = f"""
-    English textbook page for middle school students.
-    
-    CONTENT:
-    Sentence at top: "{sentence}"
-    Keywords below: {', '.join(keywords)} with phonetic symbols
-    
-    DESIGN:
-    - Large readable English text (black font on white)
-    - Simple colorful illustration related to sentence meaning
-    - Clean educational layout
-    - Portrait orientation 9:16
-    - Style like Oxford English textbook
-    - Include text AND picture
-    
-    Make educational flashcard with both text and illustration.
-    """.strip()
+    if not api_key:
+        logger.error("No image provider available (openai / apimart api_key empty)")
+        return ""
     
     # apimart API配置
     url = "https://api.apimart.ai/v1/images/generations"
@@ -174,7 +195,8 @@ def generate_sentence_image(sentence: str, keywords: list = None, output_path: s
 
 def generate_word_image(word: str, phonetic: str, definition: str = "", output_path: str = "") -> str:
     """
-    使用 SiliconFlow 图片生成 API 生成教育英文单词标注图片
+    生成教育英文单词标注图片。
+    优先 OpenAI 兼容 /images/generations；未配置时回退 SiliconFlow。
     
     Args:
         word: 英文单词
@@ -185,12 +207,6 @@ def generate_word_image(word: str, phonetic: str, definition: str = "", output_p
     Returns:
         生成的图片文件路径，失败返回空字符串
     """
-    api_key = config.siliconflow.get("api_key", "")
-    
-    if not api_key:
-        logger.error("SiliconFlow API key is not set")
-        return ""
-    
     if not output_path:
         import uuid
         output_path = f"temp/word_image_{uuid.uuid4().hex[:8]}.png"
@@ -217,6 +233,19 @@ def generate_word_image(word: str, phonetic: str, definition: str = "", output_p
     
     Make it suitable for English vocabulary learning.
     """.strip()
+
+    # 1) OpenAI 兼容第三方优先（[image] / [openai]）
+    if is_image_configured():
+        result_path = openai_generate_image(prompt, output_path)
+        if result_path:
+            return result_path
+        logger.warning("OpenAI-compatible word image failed, trying SiliconFlow fallback")
+
+    api_key = config.siliconflow.get("api_key", "")
+    
+    if not api_key:
+        logger.error("No word-image provider available (openai / siliconflow api_key empty)")
+        return ""
     
     url = "https://api.siliconflow.cn/v1/images/generations"
     

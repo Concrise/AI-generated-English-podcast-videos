@@ -7,8 +7,51 @@
 video_source = "MiniMax"
 hide_config = false
 
+# ---------------------------------------------------------------------------
+# LLM 专用
+# ---------------------------------------------------------------------------
+[llm]
+api_key = ""
+base_url = "https://api.wanyan.de/v1"
+model = "deepseek-v4-flash"
+timeout = 120
+
+# ---------------------------------------------------------------------------
+# 生图专用（OpenAI images/generations 兼容）
+# ---------------------------------------------------------------------------
+[image]
+api_key = ""
+base_url = "https://api.ephone.ai/v1"
+model = "gemini-3.1-flash-image-preview"
+size = "1024x1792"
+timeout = 180
+
+# ---------------------------------------------------------------------------
+# TTS 专用
+# provider=gemini  → Gemini generateContent AUDIO
+# provider=openai  → /audio/speech
+# ---------------------------------------------------------------------------
+[tts]
+provider = "gemini"
+api_key = ""
+base_url = "https://build2api.wanyan.de"
+model = "gemini-3.1-flash-tts-preview"
+voice = "Kore"
+timeout = 120
+
+# 旧版合并段（回退）
+[openai]
+api_key = ""
+base_url = "https://api.openai.com/v1"
+llm_model = "gpt-4o-mini"
+image_model = "dall-e-3"
+image_size = "1024x1792"
+tts_model = "tts-1"
+tts_voice = "alloy"
+timeout = 120
+
 [MiniMax]
-# MiniMax 提供 LLM 与 TTS，是本系统主力 AI 提供商
+# MiniMax 原生接口（当 [openai] 未配置时回退使用）
 # 获取 Key: https://platform.minimaxi.com/
 # 推荐 LLM 模型（2026）：MiniMax-M2.5 / MiniMax-M2.7-highspeed
 api_key = ""
@@ -17,11 +60,11 @@ llm_model = "MiniMax-M2.5"
 tts_model = "speech-2.6-hd"
 
 [siliconflow]
-# 已弃用：本系统不再使用 SiliconFlow，保留空占位避免旧代码报错
+# 单词卡生图 / TTS 回退（[openai] 未配置时可能用到）
 api_key = ""
 
 [apimart]
-# apimart 用于 AI 生成图片素材（gemini-3）
+# 句子生图回退（[openai] 未配置时可能用到）
 # 获取 Key: https://apimart.ai/
 api_key = ""
 

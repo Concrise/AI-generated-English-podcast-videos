@@ -31,13 +31,77 @@ from app.services.voice import get_siliconflow_voices, siliconflow_tts, MiniMax_
 from app.services.voice import SubMaker
 
 
+def _get_audio_file_duration(audio_file: str) -> float:
+    """读取实际 MP3 时长，避免用字幕/文字长度估算导致画面错位。"""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        audio_file,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return max(0.0, float(completed.stdout.strip()))
+    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as error:
+        logger.warning(f"Unable to probe audio duration for {audio_file}: {error}")
+        return 0.0
+
+
 def _synthesize_speech(voice_name: str, text: str, voice_file: str) -> "SubMaker | None":
     """
     统一语音合成入口：根据音色名前缀分发到对应 TTS 引擎。
-    本系统默认/主用 MiniMax TTS（音色名以 MiniMax: 开头）。
+    支持：
+      - gemini:Kore / gemini:gemini-3.1-flash-tts-preview:Puck
+      - openai:alloy
+      - MiniMax:model:voice
+      - siliconflow:model:voice
     """
-    parts = voice_name.split(":")
+    from app.services.openai_compat import is_tts_configured
+    from app.services.voice import openai_compatible_tts
+
+    raw_name = (voice_name or "").strip()
+    lower_name = raw_name.lower()
+
+    # Gemini / OpenAI 兼容 TTS（可只有音色名，如 Kore）
+    if (
+        lower_name.startswith("gemini:")
+        or lower_name.startswith("openai:")
+        or lower_name in {"kore", "puck", "charon", "fenrir", "aoede", "alloy", "nova", "echo", "fable", "onyx", "shimmer"}
+        or ":" not in raw_name
+    ):
+        if is_tts_configured():
+            normalized = raw_name
+            if ":" not in normalized:
+                normalized = f"gemini:{normalized}"
+            result = openai_compatible_tts(
+                text=text,
+                voice_name=normalized,
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
+            if result:
+                return result
+            logger.warning(f"compat TTS failed for voice={raw_name}")
+
+    parts = raw_name.split(":")
     if len(parts) < 3:
+        # 已配置 TTS 时，任意短名再试一次默认 Gemini 音色
+        if is_tts_configured():
+            return openai_compatible_tts(
+                text=text,
+                voice_name=f"gemini:{raw_name}" if raw_name else "gemini:Kore",
+                voice_rate=1.0,
+                voice_file=voice_file,
+            )
         logger.error(f"❌ 无效的语音名称格式: {voice_name}")
         return None
 
@@ -46,8 +110,15 @@ def _synthesize_speech(voice_name: str, text: str, voice_file: str) -> "SubMaker
     voice_with_gender = parts[2]
     voice = voice_with_gender.split("-")[0]
 
+    if provider in ("gemini", "openai"):
+        return openai_compatible_tts(
+            text=text,
+            voice_name=raw_name,
+            voice_rate=1.0,
+            voice_file=voice_file,
+        )
+
     if provider == "minimax":
-        # MiniMax_tts 直接接收 model 和 voice
         return MiniMax_tts(
             text=text,
             model=model,
@@ -56,17 +127,16 @@ def _synthesize_speech(voice_name: str, text: str, voice_file: str) -> "SubMaker
             voice_file=voice_file,
             voice_volume=1.0,
         )
-    else:
-        # 兼容其它前缀（如历史 siliconflow:），仍按 model:voice 拼接调用
-        full_voice = f"{model}:{voice}"
-        return siliconflow_tts(
-            text=text,
-            model=model,
-            voice=full_voice,
-            voice_rate=1.0,
-            voice_file=voice_file,
-            voice_volume=1.0,
-        )
+
+    full_voice = f"{model}:{voice}"
+    return siliconflow_tts(
+        text=text,
+        model=model,
+        voice=full_voice,
+        voice_rate=1.0,
+        voice_file=voice_file,
+        voice_volume=1.0,
+    )
 
 # 页面配置
 st.set_page_config(
@@ -201,8 +271,8 @@ def generate_fallback_image(sentence: str, keywords: list, output_path: str, spe
 def generate_podcast_video(article_text: str, output_dir: str, 
                             dialogue_turns: int = 5,
                             difficulty: str = "middle",
-                            speaker_1_voice: str = "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female",
-                            speaker_2_voice: str = "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male",
+                            speaker_1_voice: str = "gemini:Kore",
+                            speaker_2_voice: str = "gemini:Puck",
                             bgm_type: str = "random", bgm_volume: float = 0.2,
                             bgm_file: str = ""):
     """生成播客视频的完整流程"""
@@ -269,7 +339,9 @@ def generate_podcast_video(article_text: str, output_dir: str,
                     )
 
                     if sub_maker and os.path.exists(audio_path):
-                        duration = get_audio_duration(sub_maker)
+                        duration = _get_audio_file_duration(audio_path)
+                        if duration <= 0:
+                            raise RuntimeError("Unable to read generated audio duration")
                         audio_segments.append((audio_path, duration, segment_index))
                         logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
                         segment_index += 1
@@ -296,7 +368,9 @@ def generate_podcast_video(article_text: str, output_dir: str,
                     )
 
                     if sub_maker and os.path.exists(audio_path):
-                        duration = get_audio_duration(sub_maker)
+                        duration = _get_audio_file_duration(audio_path)
+                        if duration <= 0:
+                            raise RuntimeError("Unable to read generated audio duration")
                         audio_segments.append((audio_path, duration, segment_index))
                         logger.info(f"   ✅ 音频片段 {segment_index}: {duration:.2f}秒")
                         segment_index += 1
@@ -576,40 +650,34 @@ with st.sidebar:
     
     st.divider()
     
-    # 语音设置
+    # 语音设置（Gemini TTS）
     st.subheader("🎙️ 语音设置")
-    
-    # 获取可用声音列表
-    available_voices = get_siliconflow_voices()
-    
-    # 分离男声和女声
-    male_voices = [v for v in available_voices if "Male" in v]
-    female_voices = [v for v in available_voices if "Female" in v]
-    
-    # 默认选择 MiniMax 女声
-    default_female = "MiniMax:speech-2.6-hd:English_Graceful_Lady-Female"
-    if default_female not in female_voices and female_voices:
-        default_female = female_voices[0]
-    
+    st.caption("使用 Gemini TTS（build2api.wanyan.de）")
+
+    gemini_female_voices = [
+        "gemini:Kore",
+        "gemini:Aoede",
+    ]
+    gemini_male_voices = [
+        "gemini:Puck",
+        "gemini:Charon",
+        "gemini:Fenrir",
+    ]
+
     speaker_1_voice = st.selectbox(
         "对话人 1 (女声)",
-        options=female_voices if female_voices else available_voices,
-        index=(female_voices.index(default_female) if default_female in female_voices else 0) if female_voices else 0,
-        format_func=lambda x: x.split(":")[-1].replace("-Female", " (女)").replace("-Male", " (男)"),
-        key="speaker_1_voice_select"
+        options=gemini_female_voices,
+        index=0,
+        format_func=lambda x: x.split(":")[-1],
+        key="speaker_1_voice_select",
     )
-    
-    # 默认选择 MiniMax 男声
-    default_male = "MiniMax:speech-2.6-hd:English_Trustworth_Man-Male"
-    if default_male not in male_voices and male_voices:
-        default_male = male_voices[0]
-    
+
     speaker_2_voice = st.selectbox(
         "对话人 2 (男声)",
-        options=male_voices if male_voices else available_voices,
-        index=(male_voices.index(default_male) if default_male in male_voices else 0) if male_voices else 0,
-        format_func=lambda x: x.split(":")[-1].replace("-Female", " (女)").replace("-Male", " (男)"),
-        key="speaker_2_voice_select"
+        options=gemini_male_voices,
+        index=0,
+        format_func=lambda x: x.split(":")[-1],
+        key="speaker_2_voice_select",
     )
     
     st.divider()

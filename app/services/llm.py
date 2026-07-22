@@ -1,7 +1,6 @@
 """
 LLM 服务
-统一使用 MiniMax (M2-her) 生成播客脚本与关键词
-参考文档: https://platform.minimaxi.com/document/ChatCompletion
+优先使用 OpenAI 兼容第三方网关；未配置时回退 MiniMax。
 """
 import json
 import re
@@ -12,16 +11,42 @@ import requests
 
 from app.config import config
 from app.models.schema import PodcastScript
+from app.services.openai_compat import chat_completion, is_llm_configured
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(
+    prompt: str,
+    max_tokens: int = 768,
+    temperature: float = 0.7,
+) -> str:
     """
-    使用 MiniMax API 生成响应
+    生成 LLM 响应：
+    1) 若配置了 [llm]（或回退 [openai]），走 OpenAI 兼容 /chat/completions
+    2) 否则回退 MiniMax 原生接口
     """
-    # 使用 MiniMax
+    # 1) OpenAI 兼容第三方（[llm] 可与生图/TTS 的 [openai] 分站点）
+    if is_llm_configured():
+        content = chat_completion(
+            prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if content:
+            return content
+        logger.warning("OpenAI-compatible LLM failed, trying MiniMax fallback")
+
+    # 2) MiniMax 原生
     MiniMax_key = config.MiniMax.get("api_key", "")
     if MiniMax_key:
-        url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
+        # 优先使用配置中的 base_url，兼容旧硬编码路径
+        base_url = str(
+            config.MiniMax.get("base_url") or "https://api.minimaxi.com/v1"
+        ).rstrip("/")
+        # MiniMax 官方路径是 text/chatcompletion_v2；若 base_url 已是兼容网关则走 chat/completions
+        if "minimaxi.com" in base_url:
+            url = f"{base_url}/text/chatcompletion_v2"
+        else:
+            url = f"{base_url}/chat/completions"
         model = config.MiniMax.get("llm_model", "M2-her")
         headers = {
             "Authorization": f"Bearer {MiniMax_key}",
@@ -58,7 +83,7 @@ def _generate_response(prompt: str) -> str:
         except Exception as e:
             logger.warning(f"MiniMax LLM error: {str(e)}")
 
-    logger.error("MiniMax LLM failed (no provider available)")
+    logger.error("LLM failed (no provider available)")
     return ""
 
 
@@ -112,52 +137,87 @@ def generate_podcast_script(article_text: str, language: str = "English", dialog
     
     diff_req = difficulty_requirements.get(difficulty, difficulty_requirements["middle"])
     
-    prompt = f"""You are a dialogue generator. Output ONLY a valid JSON array, no other text, no markdown, no explanation.
+    # 文章过长时截断，避免中转站 504（Cloudflare 约 60–100s）
+    article_for_prompt = article_text.strip()
+    max_article_chars = 6000
+    if len(article_for_prompt) > max_article_chars:
+        logger.warning(
+            f"Article too long ({len(article_for_prompt)} chars), "
+            f"truncating to {max_article_chars} for LLM"
+        )
+        article_for_prompt = article_for_prompt[:max_article_chars] + "\n...(truncated)"
 
-Generate a {dialogue_turns}-turn {language} conversation between two people based on this article.
+    prompt = f"""You create a faithful educational podcast dialogue.
+Output ONLY a valid JSON array. Do not output analysis, reasoning, markdown, or any text outside the JSON array.
 
-Article:
-{article_text}
+The SOURCE ARTICLE below is the only factual source. The dialogue must be about this exact article, not a generic topic.
 
-Rules:
-- speaker_1 asks or opens, speaker_2 responds naturally
-- 1-2 sentences each, conversational and friendly
-- Focus on the article's main ideas
+<source_article>
+{article_for_prompt}
+</source_article>
+
+Create exactly {dialogue_turns} turns of a {language} dialogue between two people.
+
+Grounding rules:
+- Every turn must explain, question, or clarify a fact explicitly present in the source article.
+- Preserve the article's specific people, places, events, objects, numbers, and key terms when they exist.
+- Do not introduce unrelated topics, invented examples, new events, or facts absent from the source article.
+- Do not replace the article's topic with a generic English-learning, culture, school-life, or lifestyle conversation.
+- Cover the article's central facts across the dialogue.
+- speaker_1 opens or asks; speaker_2 responds directly.
+- Use one concise sentence per speaker so each utterance can be represented by one video scene.
 {diff_req}
 
-Respond with ONLY this JSON structure (exactly {dialogue_turns} objects):
-[{{"speaker_1": "...", "speaker_2": "..."}}, {{"speaker_1": "...", "speaker_2": "..."}}]
+Respond with exactly {dialogue_turns} objects in this schema:
+[
+  {{"speaker_1": "faithful question or explanation", "speaker_2": "faithful response"}}
+]
 """
 
-    response = _generate_response(prompt)
+    # DeepSeek 网关可能先生成一段推理内容，再输出最终 JSON。
+    # 600 tokens 对两轮对话不足，模型会在 JSON 之前被截断。保留至少
+    # 2048 tokens，且给较长对话更多空间，同时用上限控制网关超时风险。
+    script_token_limit = min(4096, max(2600, dialogue_turns * 450))
+    response = _generate_response(
+        prompt,
+        max_tokens=script_token_limit,
+        temperature=0.2,
+    )
 
     if not response or not response.strip():
         logger.error("LLM returned empty response, cannot generate podcast script")
         return []
 
-    # 去除 markdown 代码围栏（```json ... ``` 或 ``` ... ```），
-    # 否则 json.loads 会失败并误入文本兜底解析
-    cleaned = _strip_code_fences(response)
-
-    try:
-        # 尝试解析 JSON
-        script_data = json.loads(cleaned)
-        result = []
-        for item in script_data:
-            script = PodcastScript(
-                speaker_1=item.get("speaker_1", "").strip(),
-                speaker_2=item.get("speaker_2", "").strip(),
-                speaker_1_voice="",
-                speaker_2_voice=""
-            )
-            result.append(script)
-        if not result:
-            logger.warning("Parsed JSON produced empty podcast script")
+    result = _parse_podcast_json(response)
+    if result and _has_source_term_overlap(article_for_prompt, result):
         return result
-    except json.JSONDecodeError:
-        # 如果 JSON 解析失败，尝试从文本中提取对话
-        logger.warning("Failed to parse JSON response, falling back to text parsing")
-        return _parse_dialogue_from_text(response)
+
+    # 某些 DeepSeek 中转会先输出推理/说明文字。重新请求一次，明确要求极短回答，
+    # 避免把无关文本误判为可用播客脚本。
+    logger.warning(
+        "LLM response was not a valid podcast JSON; requesting a concise retry"
+    )
+    retry_prompt = (
+        prompt
+        + "\nIMPORTANT: Start your response with `[` and return only the JSON array. "
+        "Do not include analysis, reasoning, or markdown. Every speaker sentence must "
+        "reuse at least one concrete noun, named entity, number, or key term from the "
+        "source article."
+    )
+    retry_response = _generate_response(
+        retry_prompt,
+        max_tokens=script_token_limit,
+        temperature=0.0,
+    )
+    result = _parse_podcast_json(retry_response)
+    if result and _has_source_term_overlap(article_for_prompt, result):
+        return result
+
+    logger.error(
+        "Podcast response failed source-grounding validation; refusing to create "
+        "an unrelated video"
+    )
+    return []
 
 
 def _strip_code_fences(text: str) -> str:
@@ -174,6 +234,75 @@ def _strip_code_fences(text: str) -> str:
     if s.endswith("```"):
         s = s[:-3]
     return s.strip()
+
+
+def _parse_podcast_json(response: str) -> List[PodcastScript]:
+    """从模型输出中提取 JSON 数组，兼容前后包含说明文字或代码围栏的情况。"""
+    cleaned = _strip_code_fences(response)
+    decoder = json.JSONDecoder()
+
+    # 模型有时在 JSON 前增加一句说明；逐个尝试数组起始位置。
+    for start_index, character in enumerate(cleaned):
+        if character != "[":
+            continue
+        try:
+            script_data, _ = decoder.raw_decode(cleaned[start_index:])
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(script_data, list):
+            continue
+
+        result = []
+        for item in script_data:
+            if not isinstance(item, dict):
+                continue
+            speaker_1 = str(item.get("speaker_1") or "").strip()
+            speaker_2 = str(item.get("speaker_2") or "").strip()
+            if speaker_1 or speaker_2:
+                result.append(
+                    PodcastScript(
+                        speaker_1=speaker_1,
+                        speaker_2=speaker_2,
+                        speaker_1_voice="",
+                        speaker_2_voice="",
+                    )
+                )
+        if result:
+            return result
+
+    return []
+
+
+def _has_source_term_overlap(
+    article_text: str,
+    podcast_script: List[PodcastScript],
+) -> bool:
+    """拒绝与原文没有任何实质词汇关联的模型输出。"""
+    ignored_words = {
+        "about", "after", "also", "because", "before", "between", "could",
+        "every", "first", "from", "have", "into", "just", "more", "most",
+        "only", "other", "should", "their", "there", "these", "they", "this",
+        "what", "when", "where", "which", "with", "would", "your",
+    }
+    source_terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", article_text)
+        if term.lower() not in ignored_words
+    }
+    dialogue_text = " ".join(
+        f"{turn.speaker_1} {turn.speaker_2}" for turn in podcast_script
+    )
+    dialogue_terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", dialogue_text)
+    }
+    matched_terms = source_terms & dialogue_terms
+    logger.info(
+        f"Podcast source-grounding: {len(matched_terms)} shared terms "
+        f"({', '.join(sorted(matched_terms)[:8])})"
+    )
+    return len(matched_terms) >= 2
 
 
 

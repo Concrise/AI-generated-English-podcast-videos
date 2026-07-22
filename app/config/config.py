@@ -48,6 +48,15 @@ azure = _cfg.get("azure", {})
 siliconflow = _cfg.get("siliconflow", {})
 apimart = _cfg.get("apimart", {})
 MiniMax = _cfg.get("MiniMax", {})
+# 分站点配置：
+#   [llm]    → 对话/脚本
+#   [image]  → 生图
+#   [tts]    → 语音
+#   [openai] → 旧版合并配置（回退用）
+openai = _cfg.get("openai", {})
+llm = _cfg.get("llm", {})
+image = _cfg.get("image", {})
+tts = _cfg.get("tts", {})
 ui = _cfg.get(
     "ui",
     {
